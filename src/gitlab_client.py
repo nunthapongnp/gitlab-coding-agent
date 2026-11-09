@@ -10,6 +10,17 @@ class GitLabAPIError(RuntimeError):
     pass
 
 
+def _check_issue_iid(issue_iid: int) -> None:
+    """Validate an Issue IID argument (positive integer) before any request.
+
+    Shared by every Issue-scoped endpoint so the rejection contract is
+    identical everywhere; a non-integer input still fails via the natural
+    ``TypeError`` of the ``<`` comparison, before any HTTP round trip.
+    """
+    if issue_iid < 1:
+        raise ValueError("Issue IID must be a positive integer")
+
+
 class GitLabClient:
     """Small read-and-record GitLab REST API client.
 
@@ -78,8 +89,7 @@ class GitLabClient:
         return payload
 
     def get_issue(self, project: str | int, issue_iid: int) -> dict:
-        if issue_iid < 1:
-            raise ValueError("Issue IID must be a positive integer")
+        _check_issue_iid(issue_iid)
         payload = self._request(
             "GET", f"projects/{self._project_path(project)}/issues/{issue_iid}"
         )
@@ -102,8 +112,7 @@ class GitLabClient:
         lost at an API page boundary; the page count is bounded so a broken
         response cannot loop forever.
         """
-        if issue_iid < 1:
-            raise ValueError("Issue IID must be a positive integer")
+        _check_issue_iid(issue_iid)
         path = (
             f"projects/{self._project_path(project)}/issues/{issue_iid}/merge_requests"
         )
@@ -154,8 +163,7 @@ class GitLabClient:
         forever. Notes are returned exactly as GitLab shapes them (id, body,
         author, system, created_at, ...) in the order the pages arrive.
         """
-        if issue_iid < 1:
-            raise ValueError("Issue IID must be a positive integer")
+        _check_issue_iid(issue_iid)
         path = f"projects/{self._project_path(project)}/issues/{issue_iid}/notes"
         items: list[dict] = []
         page = 1
@@ -195,8 +203,7 @@ class GitLabClient:
         notes, and callers deduplicate by scanning ``get_issue_notes`` for a
         publication identifier before reposting an uncertain delivery.
         """
-        if issue_iid < 1:
-            raise ValueError("Issue IID must be a positive integer")
+        _check_issue_iid(issue_iid)
         if not isinstance(body, str) or not body.strip():
             raise ValueError("Note body must be a non-empty string")
         payload = self._request(
@@ -240,8 +247,7 @@ class GitLabClient:
         supported; an update with nothing to change is rejected locally
         without an HTTP round trip.
         """
-        if issue_iid < 1:
-            raise ValueError("Issue IID must be a positive integer")
+        _check_issue_iid(issue_iid)
         params: dict[str, str] = {}
         add = self._labels_param(add_labels, direction="add_labels")
         if add:
