@@ -252,6 +252,85 @@ def _select_implement_mr(
     return mr
 
 
+def _select_plan_baseline(
+    project: dict[str, Any],
+    issue_iid: int,
+    related_mrs: list[dict[str, Any]],
+) -> str | None:
+    """Apply the agreed planning-baseline matrix (implementation plan §3.3).
+
+    Order of precedent:
+    1. explicit ``--branch`` override (handled by the caller before this runs);
+    2. no related MR → the Project default branch;
+    3. exactly one related MR (open or historical) → its target branch;
+    4. several related MRs with exactly one open → that open MR's target;
+    5. several open MRs → ambiguous, reject and require an explicit branch;
+    6. other ambiguous historical cases (several closed MRs disagreeing on
+       their target branch, or a missing target branch) → reject and require
+       an explicit branch.
+
+    Returns the selected branch or ``None`` when the Project default branch
+    is missing; raises :class:`RoutingRejection` for ambiguous MR situations.
+    """
+    open_mrs = [mr for mr in related_mrs if mr.get("state") == "opened"]
+
+    def require_branch(problem: str) -> RoutingRejection:
+        return RoutingRejection(
+            f"Issue #{issue_iid} requests a Plan, but {problem} "
+            "Pass --branch to choose the planning baseline explicitly and "
+            "retry; nothing was edited or published.",
+            mode=MODE_PLAN,
+        )
+
+    def mr_target(mr: dict[str, Any]) -> str | None:
+        target = mr.get("target_branch")
+        return str(target) if target else None
+
+    if not related_mrs:
+        # Case 2: no related MR context at all — the Project default branch.
+        default_branch = project.get("default_branch")
+        return str(default_branch) if default_branch else None
+
+    if len(related_mrs) == 1:
+        # Case 3: a single related MR (open or historical) decides the target.
+        target = mr_target(related_mrs[0])
+        if not target:
+            raise require_branch(
+                f"the single related merge request "
+                f"!{related_mrs[0].get('iid', '?')} did not report a target branch."
+            )
+        return target
+
+    if len(open_mrs) == 1:
+        # Case 4: exactly one open MR among several — its target branch wins.
+        target = mr_target(open_mrs[0])
+        if not target:
+            raise require_branch(
+                f"the single open merge request !{open_mrs[0].get('iid', '?')} "
+                "did not report a target branch."
+            )
+        return target
+
+    if len(open_mrs) > 1:
+        # Case 5: several open MRs — publication baseline is ambiguous.
+        iids = ", !".join(str(mr.get("iid", "?")) for mr in open_mrs)
+        raise require_branch(
+            f"{len(open_mrs)} open merge requests are related to it "
+            f"(!{iids}), so the planning baseline is ambiguous."
+        )
+
+    # Case 6: only historical (closed/merged) MRs remain. Their targets agree
+    # only when every MR points at the same branch; otherwise it is ambiguous.
+    targets = sorted({target for mr in related_mrs if (target := mr_target(mr))})
+    if len(targets) == 1:
+        return targets[0]
+    listed = ", ".join(targets) if targets else "(none reported)"
+    raise require_branch(
+        f"several historical merge requests are related to it with disagreeing "
+        f"target branches ({listed})."
+    )
+
+
 def route_issue_request(
     *,
     gitlab: Any,
@@ -281,9 +360,12 @@ def route_issue_request(
 
     if trigger == PLAN_TRIGGER:
         if branch_override is not None:
+            # Case 1: the explicit override wins outright; related MRs are
+            # irrelevant to the baseline and are not even read.
             baseline_branch: str | None = branch_override
         else:
-            baseline_branch = project.get("default_branch") or None
+            related_mrs = gitlab.get_issue_merge_requests(project_id, issue_iid)
+            baseline_branch = _select_plan_baseline(project, issue_iid, related_mrs)
         if not baseline_branch:
             raise RoutingRejection(
                 f"GitLab project {project.get('path_with_namespace', project_id)} "
