@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, TypedDict
@@ -67,9 +66,6 @@ PLAN_FAILURE_TERMINAL_STATUSES = frozenset(
 # Read-only transport surface used by routing. Anything else (label writes,
 # MR creation, merges, approvals, user/role lookups) must never be called.
 ROUTING_READ_CALLS = frozenset({"get_project", "get_issue", "get_issue_merge_requests"})
-
-_PLAN_JSON_FENCE_RE = re.compile(r"```json\s*(.*?)\s*```", re.DOTALL)
-
 
 class WorkflowState(TypedDict, total=False):
     """State handed to the selected mode graph."""
@@ -519,34 +515,6 @@ def _worker_working_dir(operation: OperationContext, repo_dir: Path, settings: S
     return f"{mount}/{relative}"
 
 
-def _extract_plan_content(summary: Any) -> dict[str, Any]:
-    """Extract the strict-JSON plan content object from a planner response.
-
-    The synthesis contract is: the planner's final message ends with ONLY a
-    ```json fence containing the plan content (§5.1 shape). A bare JSON body
-    is also accepted. Anything else raises ``ValueError`` — malformed planner
-    output is never tolerated into publication.
-    """
-    if not isinstance(summary, str) or not summary.strip():
-        raise ValueError("planner response carried no plan content")
-    text = summary.strip()
-    candidates: list[str] = []
-    fenced = _PLAN_JSON_FENCE_RE.search(text)
-    if fenced:
-        candidates.append(fenced.group(1))
-    candidates.append(text)
-    for candidate in candidates:
-        try:
-            content = json.loads(candidate)
-        except ValueError:
-            continue
-        if isinstance(content, dict):
-            return content
-    raise ValueError(
-        "planner response did not end with a parseable JSON plan-content object"
-    )
-
-
 def _find_publication_note(notes: list[dict[str, Any]], publication_uid: str) -> dict | None:
     """Scan read notes for an already-published plan with this publication UID.
 
@@ -890,7 +858,12 @@ def build_plan_graph(
                 }
             last_result = planner_result
             try:
-                content = _extract_plan_content(planner_result.get("summary"))
+                # Shared fence extractor (planning.py): uses the LAST ```json
+                # fence in the planner message — chatter may precede it — and
+                # rejects anything that is not a parseable JSON object.
+                content = planning.extract_plan_content_json(
+                    planner_result.get("summary")
+                )
                 plan = planning.build_plan(
                     issue=state["issue"],
                     project=state["project"],

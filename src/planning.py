@@ -116,6 +116,50 @@ class PlanRecordError(RuntimeError):
 
 
 # ---------------------------------------------------------------------------
+# JSON-fence extraction (single shared helper)
+# ---------------------------------------------------------------------------
+
+
+def extract_json_fence_bodies(text: str) -> list[str]:
+    """Return every ```json fence body in ``text``, in order of appearance."""
+    return _JSON_FENCE_RE.findall(text)
+
+
+def extract_plan_content_json(text: Any) -> dict:
+    """Extract the strict-JSON plan content object from a planner message.
+
+    The synthesis contract (§5.1) is that the planner's final message ends
+    with a ```json fence containing the plan content object. Planner chatter
+    (reasoning, narration) may PRECEDE that fence, so the LAST ```json fence
+    in the message is the candidate — earlier fenced blocks are treated as
+    chatter, not payload. A bare JSON object body without any fence is also
+    accepted.
+
+    Raises ``ValueError`` when the text is empty, or no candidate (last
+    fence, then the bare body) parses into a JSON object — malformed planner
+    output is never tolerated into publication.
+    """
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("planner response carried no plan content")
+    stripped = text.strip()
+    candidates: list[str] = []
+    fenced = extract_json_fence_bodies(stripped)
+    if fenced:
+        candidates.append(fenced[-1])  # LAST fence wins; chatter may precede it
+    candidates.append(stripped)
+    for candidate in candidates:
+        try:
+            content = json.loads(candidate)
+        except ValueError:
+            continue
+        if isinstance(content, dict):
+            return content
+    raise ValueError(
+        "planner response did not end with a parseable JSON plan-content object"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Typed structures (§5.1 JSON shape)
 # ---------------------------------------------------------------------------
 
@@ -696,14 +740,14 @@ def parse_plan_note(note: dict | str) -> PlanRecordParse | None:
     if match is None:
         return None
     attrs = dict(_MARKER_ATTR_RE.findall(match.group("attrs") or ""))
-    fence = _JSON_FENCE_RE.search(body, match.end())
-    if fence is None:
+    fences = extract_json_fence_bodies(body[match.end():])
+    if not fences:
         return PlanRecordParse(
             attrs=attrs, payload=None,
             error="plan marker present but no fenced ```json payload found",
         )
     try:
-        payload = json.loads(fence.group(1))
+        payload = json.loads(fences[0])
     except json.JSONDecodeError as exc:
         return PlanRecordParse(
             attrs=attrs, payload=None,
