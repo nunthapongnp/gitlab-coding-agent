@@ -1169,6 +1169,76 @@ def _normalize_hint(hint: dict) -> dict:
     }
 
 
+def _normalized_dir(value: str) -> str:
+    """Normalize a working-directory string for comparison ('.' = repo root)."""
+    cleaned = value.strip().replace("\\", "/")
+    while cleaned.startswith("./"):
+        cleaned = cleaned[2:]
+    cleaned = cleaned.rstrip("/")
+    return cleaned or "."
+
+
+def _inspection_directories(inspection: dict | None) -> set[str]:
+    """Working directories discoverable from the inspection evidence.
+
+    Candidates: the repo root (``.``), every module path recorded by the
+    deterministic inspection walk (plus its leading components — evidence
+    modules are top-level directory names), and every directory containing a
+    recorded configuration/manifest file. This is evidence-derived ONLY: the
+    repository tree itself is never re-walked here, and task ``modules``
+    (semantic scope, ADR 0003) are deliberately never cross-checked.
+    """
+    dirs: set[str] = {"."}
+    for module in (inspection or {}).get("modules") or []:
+        path = module.get("path") if isinstance(module, dict) else module
+        if not isinstance(path, str) or not path.strip():
+            continue
+        parts = [
+            part
+            for part in path.strip().replace("\\", "/").split("/")
+            if part and part != "."
+        ]
+        for index in range(1, len(parts) + 1):
+            dirs.add("/".join(parts[:index]))
+    for config in (inspection or {}).get("config_files") or []:
+        if not isinstance(config, str) or not config.strip():
+            continue
+        parts = [
+            part
+            for part in config.strip().replace("\\", "/").split("/")
+            if part and part != "."
+        ]
+        # Directories CONTAINING the config file (the file name itself is
+        # not a directory); a root-level config contributes "." only.
+        for index in range(1, len(parts)):
+            dirs.add("/".join(parts[:index]))
+    return dirs
+
+
+def _hint_cwd_violations(hints: list[dict], inspection: dict | None) -> list[str]:
+    """Cross-check validation-hint working directories against the evidence.
+
+    Each hint's ``cwd`` must be the repo root (``.``) or a directory the
+    inspection actually observed (module paths / config-file directories).
+    A fabricated working directory is a §5.1 violation: verification hints
+    must be runnable against the inspected repository, not invented paths.
+    """
+    if not hints:
+        return []
+    allowed = _inspection_directories(inspection)
+    violations: list[str] = []
+    for index, hint in enumerate(hints):
+        cwd = _normalized_dir(str(hint.get("cwd") or "."))
+        if cwd not in allowed:
+            violations.append(
+                f"validation_hints[{index}].cwd: working directory {cwd!r} "
+                "was not discovered by inspection; hints must run in '.' or "
+                "a directory recorded in the inspection evidence ("
+                f"{', '.join(sorted(allowed))})"
+            )
+    return violations
+
+
 def build_plan(
     *,
     issue: dict,
@@ -1208,6 +1278,12 @@ def build_plan(
       False and the questions are carried verbatim (normalized, never
       rejected silently — P0-SPEC-004).
 
+    Every ``validation_hints[].cwd`` is cross-checked against the inspection
+    evidence: it must be ``.`` (repo root) or a directory the inspection
+    actually observed (module paths / config-file directories); a fabricated
+    working directory raises ``PlanValidationError``. Task ``modules`` are
+    NOT cross-checked against the repository tree (semantic scope, ADR 0003).
+
     Returns a validated :class:`ExecutionPlan`; use ``build_publication_note``
     to render the append-only comment.
     """
@@ -1237,6 +1313,13 @@ def build_plan(
     # unresolved question forces executable=false and the questions travel
     # with the plan, so reviewers see exactly why it is blocked.
     executable = bool(requirement.strip()) and not unresolved
+
+    normalized_hints = [_normalize_hint(hint) for hint in (validation_hints or [])]
+    # §5.1: verification-hint working directories must be real — the repo
+    # root or a directory the inspection actually observed. A fabricated cwd
+    # (e.g. "nonexistent/module") is a validation violation, reported
+    # together with every other collected violation below.
+    cwd_violations = _hint_cwd_violations(normalized_hints, inspection)
 
     plan = ExecutionPlan(
         schema_version=PLAN_SCHEMA_VERSION,
@@ -1270,14 +1353,20 @@ def build_plan(
             for index, task in enumerate(tasks or [])
         ],
         validation_hints=[
-            PlanValidationHint(**_normalize_hint(hint))
-            for hint in (validation_hints or [])
+            PlanValidationHint(**hint) for hint in normalized_hints
         ],
     )
 
-    validate_plan(
-        plan.to_dict(),
-        project_id=plan.project_id,
-        issue_iid=plan.issue_iid,
-    )
+    try:
+        validate_plan(
+            plan.to_dict(),
+            project_id=plan.project_id,
+            issue_iid=plan.issue_iid,
+        )
+    except PlanValidationError as exc:
+        raise PlanValidationError(
+            list(exc.violations) + cwd_violations
+        ) from None
+    if cwd_violations:
+        raise PlanValidationError(cwd_violations)
     return plan

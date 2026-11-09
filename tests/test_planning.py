@@ -960,3 +960,73 @@ class TestBuildPlan:
                         "acceptance": ["A"]}],
                 version=0,
             )
+
+
+class TestBuildPlanHintWorkingDirectories:
+    """§5.1: validation-hint cwd must be real, discovered by inspection."""
+
+    def _build(self, **overrides) -> ExecutionPlan:
+        kwargs = dict(
+            issue=make_issue(),
+            project=make_project(),
+            inspection=make_inspection(),
+            requirement_understanding="Expected behavior",
+            tasks=[{"title": "T", "scope": "S", "modules": ["api"],
+                    "acceptance": ["A"]}],
+        )
+        kwargs.update(overrides)
+        return build_plan(**kwargs)
+
+    @pytest.mark.parametrize("cwd", [".", "api", "./api", "api/"])
+    def test_repo_root_and_inspected_module_dirs_are_accepted(self, cwd):
+        plan = self._build(validation_hints=[make_hint(cwd=cwd)])
+        # Everything normalizes to a directory the evidence discovered.
+        assert plan.validation_hints[0].cwd
+
+    def test_config_file_directory_is_discoverable_from_evidence(self):
+        # The config file lives at api/pom.xml: its directory is evidence.
+        inspection = make_inspection(modules=[], config_files=["api/pom.xml"])
+        plan = self._build(
+            inspection=inspection, validation_hints=[make_hint(cwd="api")]
+        )
+        assert plan.validation_hints[0].cwd == "api"
+
+    def test_fabricated_cwd_is_a_validation_violation(self):
+        with pytest.raises(PlanValidationError) as excinfo:
+            self._build(
+                validation_hints=[make_hint(cwd="nonexistent/module")]
+            )
+        violations = excinfo.value.violations
+        assert any(
+            "validation_hints[0].cwd" in v and "nonexistent/module" in v
+            for v in violations
+        )
+        # The actionable message names the directories the evidence has.
+        assert any("api" in v for v in violations)
+
+    def test_cwd_violations_are_collected_alongside_other_violations(self):
+        with pytest.raises(PlanValidationError) as excinfo:
+            self._build(
+                tasks=[{"title": "", "scope": "", "modules": [],
+                        "acceptance": []}],
+                validation_hints=[
+                    make_hint(cwd="made-up/dir"),
+                    make_hint(cwd="api"),  # valid; must not be flagged
+                ],
+            )
+        violations = excinfo.value.violations
+        assert any("validation_hints[0].cwd" in v for v in violations)
+        assert not any("validation_hints[1].cwd" in v for v in violations)
+        # The schema violations are reported in the SAME collected error.
+        assert any("tasks[0].title" in v for v in violations)
+
+    def test_task_modules_are_never_crosschecked_against_the_tree(self, tmp_path):
+        # ADR 0003: modules are semantic scope. A module name with no
+        # corresponding inspected directory must NOT be a violation.
+        plan = self._build(
+            inspection=make_inspection(modules=[]),
+            tasks=[{"title": "T", "scope": "S", "modules": ["brand/new/module"],
+                    "acceptance": ["A"]}],
+            validation_hints=[make_hint(cwd=".")],
+        )
+        assert plan.tasks[0].modules == ["brand/new/module"]
