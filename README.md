@@ -127,6 +127,42 @@ pytest -m runtime_probe -q   # requires a running Docker daemon
 pytest -q                    # offline suite; probes are deselected by default
 ```
 
+## Run outcomes and exit codes
+
+A Plan run publishes **one** complete plan comment on the Issue and moves its
+labels `agent::plan` → `agent::in-progress` → `agent::needs-review` (unrelated
+labels are preserved). The console report ends with a `=== Plan publication ===`
+section:
+
+```
+=== Plan publication ===
+Plan    : PLAN-v1 (version 1)
+Note    : #12
+Publication UID: op-20261109T…
+Outcome : EXECUTABLE — ready for human review
+Unresolved questions: 0
+Labels  : transitioned_to_needs_review
+```
+
+- **EXECUTABLE** — the plan has no unresolved questions; it is ready for human
+  review and later `agent::approved` execution.
+- **CLARIFICATION REQUIRED — NOT executable** — the planner recorded unresolved
+  questions (e.g. conflicting requirements). The plan comment is still
+  published for review, but it must be answered and regenerated (new
+  `PLAN-vN` version) before it can be approved.
+
+`poc-result.json` carries the same distinction structurally in
+`plan_publication.executable`, plus an `exit_code_semantics` map. Exit codes:
+
+| Code | Meaning |
+|---|---|
+| `0` | Workflow completed; a plan was published (executable **or** clarification-required — distinguished by `plan_publication.executable` and the console marking) |
+| `1` | Infrastructure failure: inspection/synthesis/publication failed or blocked (`inspection_failed`, `inspection_blocked`, `plan_synthesis_failed`, `publication_failed`); nothing was published |
+| `2` | Invalid invocation, concurrent operation lock, or routing/state rejection (`rejected`, `operation_locked`); nothing was edited or published |
+
+Publication is deduplicated by publication UID: a re-run that lost the POST
+response re-scans the Issue comments and never posts a duplicate plan version.
+
 ## Run on local
 ```bash
 python -m venv .venv
