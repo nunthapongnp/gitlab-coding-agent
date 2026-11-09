@@ -3,9 +3,40 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from .config import Settings
+from .config import Settings, split_model_provider
 
 PROMPT_PATH = Path(__file__).resolve().parent / "prompt" / "base_prompt.md"
+
+
+def build_llm_kwargs(settings: Settings) -> dict:
+    """Build LLM constructor arguments from the ONCE-normalized model string.
+
+    The configured value is honored: the provider prefix decides how the
+    Ollama endpoint is addressed, and no additional prefix is stacked here.
+    - ``ollama/<model>``       → LiteLLM native Ollama provider, base URL as
+      configured (no ``/v1`` suffix).
+    - ``openai/<model>``       → OpenAI-compatible endpoint at
+      ``<base_url>/v1`` (Ollama's OpenAI-compatible API).
+    Other providers pass the configured base URL through unchanged.
+    """
+    provider, bare_model = split_model_provider(settings.ollama_model)
+    if provider in ("ollama", "ollama_chat"):
+        return {
+            "model": f"{provider}/{bare_model}",
+            "api_key": settings.ollama_api_key,
+            "base_url": settings.ollama_base_url,
+        }
+    if provider == "openai":
+        return {
+            "model": f"openai/{bare_model}",
+            "api_key": settings.ollama_api_key,
+            "base_url": f"{settings.ollama_base_url}/v1",
+        }
+    return {
+        "model": settings.ollama_model,
+        "api_key": settings.ollama_api_key,
+        "base_url": settings.ollama_base_url,
+    }
 
 def make_agent_prompt(
     issue: dict,
@@ -70,9 +101,7 @@ def run_openhands(
         ) from exc
 
     llm = LLM(
-        model=f"openai/{settings.ollama_model}",
-        api_key=settings.ollama_api_key,
-        base_url=f"{settings.ollama_base_url}/v1",
+        **build_llm_kwargs(settings),
         timeout=settings.timeout_seconds,
     )
     agent = Agent(
