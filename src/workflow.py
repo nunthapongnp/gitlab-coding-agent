@@ -667,14 +667,62 @@ def build_plan_graph(
         # using add/remove operations only so unrelated labels survive. The
         # failure is truthful and terminal: no inspection, no publication.
         issue_iid = state["issue_iid"]
+        project_id = state["project"]["id"]
         outcome = {
             "transition": "plan_to_in_progress",
             "removed_labels": ["agent::plan"],
             "added_labels": ["agent::in-progress"],
         }
+        # Re-read the Issue UNDER the lock (§3.2 race guard): the labels may
+        # have changed between routing (read without the lock) and this
+        # transition — e.g. a human added agent::approved. Transitioning on
+        # stale labels would act on a request that no longer exists.
+        try:
+            fresh_issue = _gitlab().get_issue(project_id, issue_iid)
+        except _GITLAB_FAILURES as exc:
+            failure = {
+                **outcome,
+                "outcome": "failed",
+                "error": str(exc),
+            }
+            return {
+                "status": STATUS_INSPECTION_FAILED,
+                "error_message": (
+                    f"Could not re-read Issue #{issue_iid} under the Issue "
+                    f"lock before its label transition: {exc}. Nothing was "
+                    "transitioned, no inspection clone was prepared, and "
+                    "nothing was published; the lock is released by "
+                    "finalization."
+                ),
+                "label_outcomes": [failure],
+            }
+        fresh_labels = [str(label) for label in (fresh_issue.get("labels") or [])]
+        recognized = _recognized_labels(fresh_labels, ISSUE_AGENT_STATES)
+        if recognized != [PLAN_TRIGGER]:
+            blocked = {
+                **outcome,
+                "outcome": "blocked_labels_changed",
+                "found_labels": fresh_labels,
+            }
+            return {
+                "status": STATUS_INSPECTION_BLOCKED,
+                "error_message": (
+                    f"Issue #{issue_iid} no longer carries exactly "
+                    f"{PLAN_TRIGGER} under the Issue lock; its current "
+                    f"recognized agent labels are: "
+                    f"{_describe_labels(sorted(recognized))} (all labels: "
+                    f"{_describe_labels(fresh_labels)}). The Issue state "
+                    "changed after routing — possibly a human transitioned "
+                    "or approved it. Nothing was transitioned, no inspection "
+                    "clone was prepared, nothing was published, and no other "
+                    "labels were touched. Re-run with the Issue carrying "
+                    f"exactly {PLAN_TRIGGER} to start a fresh Plan."
+                ),
+                "label_outcomes": [blocked],
+            }
         try:
             _gitlab().update_issue_labels(
-                state["project"]["id"],
+                project_id,
                 issue_iid,
                 remove_labels=["agent::plan"],
                 add_labels=["agent::in-progress"],

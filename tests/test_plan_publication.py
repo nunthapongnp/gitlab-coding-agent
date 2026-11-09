@@ -43,6 +43,7 @@ from src.gitlab_client import GitLabAPIError
 from src.planner_runner import PLAN_SYNTHESIZER_ROLE_HEADER
 from src.planning import parse_plan_note
 from src.workflow import (
+    STATUS_INSPECTION_BLOCKED,
     STATUS_PLAN_NEEDS_CLARIFICATION,
     STATUS_PLAN_PUBLISHED,
     STATUS_PLAN_SYNTHESIS_FAILED,
@@ -222,6 +223,26 @@ class NeedsReviewTransitionFailureTransport(FakeGitLabTransport):
         return super().update_issue_labels(
             project_id, issue_iid, add_labels=add_labels, remove_labels=remove_labels
         )
+
+
+class LabelMutationTransport(FakeGitLabTransport):
+    """Swaps the Issue labels on the SECOND get_issue call.
+
+    Routing reads the Issue WITHOUT the lock (first read); activate_issue
+    re-reads it UNDER the Issue lock (second read) — that second read sees
+    the mutation a human made between routing and the transition (e.g. an
+    agent::approved label added).
+    """
+
+    def __init__(self, *args, mutated_labels: list[str], **kwargs):
+        super().__init__(*args, **kwargs)
+        self._mutated_labels = list(mutated_labels)
+
+    def get_issue(self, project_id, issue_iid):
+        prior_reads = [name for name, _ in self.calls if name == "get_issue"]
+        if prior_reads:  # this is the second+ read: labels mutated meanwhile
+            self.issue["labels"] = list(self._mutated_labels)
+        return super().get_issue(project_id, issue_iid)
 
 
 # ---------------------------------------------------------------------------
@@ -570,6 +591,66 @@ class TestLabelFailureAfterPublication:
         ]
         assert len(failures) == 1
         assert "agent::needs-review" in failures[0]["error"] or "GitLab" in failures[0]["error"]
+
+
+# ---------------------------------------------------------------------------
+# Spec (a)1 — Issue labels re-read under the lock before the transition
+# ---------------------------------------------------------------------------
+
+
+class TestLabelsMutatedUnderLock:
+    def test_label_mutation_under_lock_blocks_transition_without_publication(
+        self, tmp_path, origin_repo
+    ):
+        settings = make_inspection_settings(tmp_path)
+        transport = FakePlannerTransport()
+        gitlab = LabelMutationTransport(
+            make_project_with_origin(origin_repo),
+            make_issue(["agent::plan"]),
+            mutated_labels=["agent::plan", "agent::approved"],
+        )
+
+        result, gitlab = run_plan_workflow(
+            origin_repo, settings, transport, gitlab=gitlab
+        )
+
+        # Truthful blocked terminal: the Issue no longer carries exactly
+        # agent::plan under the lock, so nothing acts on the stale routing.
+        assert result["status"] == STATUS_INSPECTION_BLOCKED
+        message = result["error_message"]
+        assert "no longer carries exactly agent::plan" in message
+        assert "agent::approved" in message
+        # No label transition happened at all: the mutated labels survive
+        # untouched and no needs-review was applied.
+        assert not label_writes(gitlab)
+        assert gitlab.issue["labels"] == ["agent::plan", "agent::approved"]
+        # Nothing was published (no plan comment, no needs-review transition).
+        assert note_posts(gitlab) == []
+        assert "agent::needs-review" not in gitlab.issue["labels"]
+        # The blocked outcome is recorded as a truthful label_outcome.
+        blocked = [
+            outcome
+            for outcome in result["label_outcomes"]
+            if outcome["outcome"] == "blocked_labels_changed"
+        ]
+        assert len(blocked) == 1
+        assert blocked[0]["found_labels"] == ["agent::plan", "agent::approved"]
+        # The planner never ran: blocked before the clone/inspection.
+        assert transport.calls == []
+        # finalize_inspection ran on the failure routing: the lock is released.
+        lock_files = list((tmp_path / "control" / "locks").glob("issue-*.lock"))
+        assert lock_files
+        assert json.loads(lock_files[0].read_text())["released_at"]
+        # get_issue is part of the accepted Plan read surface; nothing else
+        # beyond it was written.
+        assert {name for name, _ in gitlab.calls} <= {
+            "get_project",
+            "get_issue",
+            "get_issue_merge_requests",
+            "get_issue_notes",
+            "add_issue_note",
+            "update_issue_labels",
+        }
 
 
 # ---------------------------------------------------------------------------
