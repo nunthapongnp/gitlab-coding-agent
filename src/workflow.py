@@ -435,6 +435,7 @@ def build_plan_graph(
     from .workspace import (
         ConcurrentOperationError,
         OperationWorkspaceError,
+        acquire_issue_and_branch_locks,
         create_operation_context as _default_operation_factory,
         release_locks,
     )
