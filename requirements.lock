@@ -1,0 +1,25 @@
+# Pinned, compatibility-probed dependency set for the coding agent.
+#
+# Tested combination (see README "Tested package set"):
+#   CPython 3.14.7 (macOS arm64 host and linux/aarch64 containers)
+#   openhands-sdk / openhands-tools / openhands-agent-server /
+#   openhands-workspace == 1.60.2, verified by import + remote-workspace
+#   construction against the installed packages.
+# OpenHands requires Python >= 3.12; 3.14 is verified here.
+#
+# Runtime images (docker/Dockerfile.coordinator, docker/Dockerfile.planner)
+# install exactly this lock.
+
+# --- application dependencies ---
+langgraph>=1.0,<2.0
+requests>=2.32,<3
+python-dotenv>=1.0,<2
+
+# --- OpenHands tested set (compatibility-probed; do not bump casually) ---
+openhands-sdk==1.60.2
+openhands-tools==1.60.2
+openhands-agent-server==1.60.2
+openhands-workspace==1.60.2
+
+# --- test dependencies ---
+pytest>=8,<10

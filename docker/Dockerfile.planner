@@ -1,0 +1,30 @@
+# Planner Agent Server worker image (read-only repository role).
+#
+# Role isolation (ADR 0002): this service is a SEPARATELY STARTED OpenHands
+# Agent Server reached over its supported remote API. It receives NO GitLab
+# credentials and NO Docker socket; compose mounts the operation workspace
+# READ-ONLY at /workspace. Its working directory /state is writable for the
+# server's own runtime files (conversations, bash events) and is per-operation
+# container-local storage, never a product workspace.
+FROM python:3.12-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.lock /tmp/requirements.lock
+RUN pip install --no-cache-dir -r /tmp/requirements.lock && rm /tmp/requirements.lock
+
+ENV OPENHANDS_SUPPRESS_BANNER=1
+
+# Writable server state directory (NOT the repository mount).
+RUN mkdir -p /state && chmod 777 /state
+WORKDIR /state
+
+EXPOSE 8000
+
+# Verified Agent Server invocation (openhands-agent-server 1.60.2):
+#   python -m openhands.agent_server --host 0.0.0.0 --port 8000
+# Liveness: GET /health. Authentication: OH_SESSION_API_KEYS_0 (set by
+# compose); clients send it as the X-Session-API-Key header.
+ENTRYPOINT ["python", "-m", "openhands.agent_server", "--host", "0.0.0.0", "--port", "8000"]

@@ -1,0 +1,25 @@
+# Coordinator image: trusted side (CLI + LangGraph workflow + Git).
+# Owns the GitLab token; talks to the separately started Planner Agent Server
+# worker over its HTTP API. Never exposes the host Docker socket to workers.
+FROM python:3.12-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install the pinned, compatibility-probed dependency set.
+COPY requirements.lock /app/requirements.lock
+RUN pip install --no-cache-dir -r /app/requirements.lock
+
+COPY main.py /app/main.py
+COPY src /app/src
+
+# Runtime mounts provided by compose:
+#   /workspace  per-operation workspace volume (fresh clone lives here)
+#   /artifacts  per-operation artifact directory (bind mount, outside checkout)
+#   /control    shared control volume (Issue/branch lock metadata)
+# Entrypoint is the SAME application invocation the host CLI uses; the
+# launchers append the CLI arguments (python main.py "$@").
+ENTRYPOINT ["python", "main.py"]
