@@ -773,6 +773,112 @@ def build_plan_graph(
             "evidence_path": str(evidence_path),
         }
 
+    def _record_synthesis_failure(
+        *,
+        status: str,
+        message: str,
+        version: int,
+        publication_uid: str,
+        attempts: list[dict[str, Any]],
+        error: str | None = None,
+    ) -> dict[str, Any]:
+        """Assemble a truthful synthesis-failure state update.
+
+        Nothing is published on any of these paths; the synthesis evidence
+        record carries the publication identity and every attempt so far.
+        ``error`` is included only when the failure carries a distinct setup
+        problem (PlannerSetupError) worth surfacing as its own key.
+        """
+        record: dict[str, Any] = {
+            "publication_uid": publication_uid,
+            "allocated_version": version,
+            "attempts": attempts,
+        }
+        if error is not None:
+            record["error"] = error
+        return {"status": status, "error_message": message, "plan_synthesis": record}
+
+    def _run_synthesis_attempt(
+        attempt: int,
+        prompt: str,
+        attempts: list[dict[str, Any]],
+        *,
+        context: OperationContext,
+        repo_dir: Path,
+        version: int,
+        publication_uid: str,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        """Run one synthesis transport call.
+
+        Returns ``(planner_result, None)`` on success, or ``(None, failure)``
+        where ``failure`` is the truthful terminal state update for a setup
+        block (PlannerSetupError) or a failed conversation (PlannerRunError).
+        """
+        try:
+            planner_result = transport.run(
+                prompt=prompt,
+                repo_dir=repo_dir,
+                worker_working_dir=_worker_working_dir(context, repo_dir, settings),
+                operation=context,
+                settings=settings,
+            )
+        except PlannerSetupError as exc:
+            return None, _record_synthesis_failure(
+                status=STATUS_INSPECTION_BLOCKED,
+                message=(
+                    f"Plan synthesis could not start: {exc} Nothing was "
+                    "published; the Issue stays agent::in-progress."
+                ),
+                version=version,
+                publication_uid=publication_uid,
+                attempts=attempts,
+                error=str(exc),
+            )
+        except PlannerRunError as exc:
+            attempts.append(
+                {"attempt": attempt, "planner": {"status": "failed", "error": str(exc)}}
+            )
+            return None, _record_synthesis_failure(
+                status=STATUS_PLAN_SYNTHESIS_FAILED,
+                message=(
+                    f"Plan synthesis conversation failed: {exc} Nothing "
+                    "was published; the Issue stays agent::in-progress."
+                ),
+                version=version,
+                publication_uid=publication_uid,
+                attempts=attempts,
+            )
+        return planner_result, None
+
+    def _assemble_synthesized_plan(
+        content: dict[str, Any],
+        *,
+        issue: dict[str, Any],
+        project: dict[str, Any],
+        inspection: dict[str, Any],
+        version: int,
+        publication_uid: str,
+    ):
+        """Deterministically assemble + validate the planner's content (§5.1)."""
+        from . import planning
+
+        return planning.build_plan(
+            issue=issue,
+            project=project,
+            inspection=inspection,
+            requirement_understanding=str(
+                content.get("requirement_understanding") or ""
+            ),
+            impact=content.get("impact"),
+            tasks=content.get("tasks"),
+            validation_hints=content.get("validation_hints"),
+            # Unresolved/conflicting requirements travel with the
+            # plan and force executable=false — never dropped (§5.1).
+            unresolved_questions=content.get("unresolved_questions"),
+            version=version,
+            publication_uid=publication_uid,
+        )
+
     def synthesize_plan(state: WorkflowState) -> dict[str, Any]:
         # All of this happens under the held Issue lock: notes are re-read
         # fresh so version allocation (§5.3) sees every plan published up to
@@ -823,45 +929,17 @@ def build_plan_graph(
         plan = None
         last_result: dict[str, Any] = {}
         for attempt in range(1, 3):  # one original try + one correction retry
-            try:
-                planner_result = transport.run(
-                    prompt=prompt,
-                    repo_dir=Path(state["workspace_repo_dir"]),
-                    worker_working_dir=_worker_working_dir(
-                        context, Path(state["workspace_repo_dir"]), settings
-                    ),
-                    operation=context,
-                    settings=settings,
-                )
-            except PlannerSetupError as exc:
-                return {
-                    "status": STATUS_INSPECTION_BLOCKED,
-                    "error_message": (
-                        f"Plan synthesis could not start: {exc} Nothing was "
-                        "published; the Issue stays agent::in-progress."
-                    ),
-                    "plan_synthesis": {
-                        "publication_uid": publication_uid,
-                        "allocated_version": version,
-                        "attempts": attempts,
-                        "error": str(exc),
-                    },
-                }
-            except PlannerRunError as exc:
-                last_result = {"status": "failed", "error": str(exc)}
-                attempts.append({"attempt": attempt, "planner": last_result})
-                return {
-                    "status": STATUS_PLAN_SYNTHESIS_FAILED,
-                    "error_message": (
-                        f"Plan synthesis conversation failed: {exc} Nothing "
-                        "was published; the Issue stays agent::in-progress."
-                    ),
-                    "plan_synthesis": {
-                        "publication_uid": publication_uid,
-                        "allocated_version": version,
-                        "attempts": attempts,
-                    },
-                }
+            planner_result, failure = _run_synthesis_attempt(
+                attempt,
+                prompt,
+                attempts,
+                context=context,
+                repo_dir=Path(state["workspace_repo_dir"]),
+                version=version,
+                publication_uid=publication_uid,
+            )
+            if failure is not None:
+                return failure
             last_result = planner_result
             try:
                 # Shared fence extractor (planning.py): uses the LAST ```json
@@ -870,19 +948,11 @@ def build_plan_graph(
                 content = planning.extract_plan_content_json(
                     planner_result.get("summary")
                 )
-                plan = planning.build_plan(
+                plan = _assemble_synthesized_plan(
+                    content,
                     issue=state["issue"],
                     project=state["project"],
                     inspection=evidence,
-                    requirement_understanding=str(
-                        content.get("requirement_understanding") or ""
-                    ),
-                    impact=content.get("impact"),
-                    tasks=content.get("tasks"),
-                    validation_hints=content.get("validation_hints"),
-                    # Unresolved/conflicting requirements travel with the
-                    # plan and force executable=false — never dropped (§5.1).
-                    unresolved_questions=content.get("unresolved_questions"),
                     version=version,
                     publication_uid=publication_uid,
                 )
@@ -904,20 +974,18 @@ def build_plan_graph(
                     correction=correction,
                 )
         if plan is None:
-            return {
-                "status": STATUS_PLAN_SYNTHESIS_FAILED,
-                "error_message": (
+            return _record_synthesis_failure(
+                status=STATUS_PLAN_SYNTHESIS_FAILED,
+                message=(
                     f"Planner did not return a valid plan content object after "
                     f"one correction retry (last problem: {correction}). No "
                     "plan comment was published; the Issue stays "
                     "agent::in-progress."
                 ),
-                "plan_synthesis": {
-                    "publication_uid": publication_uid,
-                    "allocated_version": version,
-                    "attempts": attempts,
-                },
-            }
+                version=version,
+                publication_uid=publication_uid,
+                attempts=attempts,
+            )
 
         synthesis_record = {
             "publication_uid": publication_uid,
