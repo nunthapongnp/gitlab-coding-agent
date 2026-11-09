@@ -1,5 +1,25 @@
 from __future__ import annotations
 
+"""CLI entry point and application boundary.
+
+Exit-code semantics (implementation plan §11):
+- ``0`` — the workflow completed and finalized. For Plan mode this covers BOTH
+  published kinds: an executable plan AND a clarification-required plan. A
+  clarification-required plan is an honest, complete outcome (the plan comment
+  is published and the Issue is ready for human review with the unresolved
+  questions attached), so it must NOT be reported as an infrastructure
+  failure; it is distinguished by ``status``/``plan_publication.executable``
+  in ``poc-result.json`` and by an explicit ``CLARIFICATION REQUIRED`` marker
+  in the console output.
+- ``1`` — infrastructure failure: planner worker errors, GitLab API errors,
+  Git errors, or a failed/blocked inspection, synthesis, or publication
+  (``inspection_failed``, ``inspection_blocked``, ``plan_synthesis_failed``,
+  ``publication_failed``). Nothing may have been published.
+- ``2`` — invalid invocation, concurrent operation lock, or routing/state
+  rejection (``rejected``/``operation_locked``). Nothing was edited or
+  published.
+"""
+
 import argparse
 import json
 import sys
@@ -114,9 +134,10 @@ def main() -> int:
 
     from src.workspace import ConcurrentOperationError
     from src.workflow import (
-        STATUS_INSPECTION_BLOCKED,
-        STATUS_INSPECTION_FAILED,
+        PLAN_FAILURE_TERMINAL_STATUSES,
         STATUS_OPERATION_LOCKED,
+        STATUS_PLAN_NEEDS_CLARIFICATION,
+        STATUS_PLAN_PUBLISHED,
         RoutingRejection,
         WorkflowUnavailableError,
         run_routed_workflow,
@@ -155,9 +176,10 @@ def main() -> int:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
-    # Inspection outcomes: complete vs failed/blocked have distinct exit codes.
+    # Plan/inspection infrastructure outcomes: failed, blocked, synthesis, or
+    # publication failures exit 1 (nothing was published on these paths).
     status = result.get("status")
-    if status in (STATUS_INSPECTION_FAILED, STATUS_INSPECTION_BLOCKED):
+    if status in PLAN_FAILURE_TERMINAL_STATUSES:
         message = result.get("error_message") or status
         print(f"ERROR: {message}", file=sys.stderr)
         _save_report(
@@ -170,7 +192,10 @@ def main() -> int:
         )
         return 1
 
-    # Fully successful workflow plus finalization.
+    # Fully successful workflow plus finalization. Both published kinds exit 0;
+    # a clarification-required plan is marked explicitly (§11) so operators and
+    # automation can distinguish it from an executable plan without parsing
+    # the published comment.
     issue = result.get("issue", {})
     print("\n=== Routing ===")
     print(f"Mode    : {result.get('mode')}")
@@ -187,6 +212,36 @@ def main() -> int:
             f"{len(evidence.get('modules') or [])} modules; "
             f"{len(evidence.get('config_files') or [])} config/manifest files"
         )
+    publication = result.get("plan_publication") or {}
+    if publication:
+        # Both published kinds exit 0; the marking below is what tells them
+        # apart on the console (§11: distinguishable in console output AND
+        # structured diagnostics).
+        if publication.get("executable"):
+            outcome = "EXECUTABLE — ready for human review"
+        else:
+            outcome = (
+                "CLARIFICATION REQUIRED — NOT executable (unresolved questions "
+                "must be answered and the plan regenerated with a new version)"
+            )
+        print("\n=== Plan publication ===")
+        print(
+            f"Plan    : {publication.get('plan_id')} "
+            f"(version {publication.get('version')})"
+        )
+        print(f"Note    : #{publication.get('note_id')}")
+        print(f"Publication UID: {publication.get('publication_uid')}")
+        print(f"Outcome : {outcome}")
+        print(
+            f"Unresolved questions: "
+            f"{publication.get('unresolved_questions_count', 0)}"
+        )
+        print(f"Labels  : {publication.get('label_outcome')}")
+        if publication.get("deduplicated"):
+            print(
+                "Dedup   : an existing plan note with this publication UID was "
+                "reused; no duplicate was posted"
+            )
     _save_report(
         args,
         settings,
@@ -197,6 +252,18 @@ def main() -> int:
             "issue_iid": issue.get("iid", args.issue),
             "operation_id": operation.get("operation_id"),
             "evidence_path": result.get("evidence_path"),
+            "plan_publication": publication or None,
+            # Exit-code semantics for this invocation, kept next to the
+            # structured outcome so automation never has to guess (§11).
+            "exit_code_semantics": {
+                "0": "workflow completed; a plan was published (executable "
+                "and clarification-required kinds are distinguished by "
+                "plan_publication.executable)",
+                "1": "infrastructure failure (inspection/synthesis/publication "
+                "failed or blocked); nothing was published",
+                "2": "invalid invocation, concurrent operation, or routing "
+                "rejection; nothing was edited or published",
+            },
         },
     )
     return 0
