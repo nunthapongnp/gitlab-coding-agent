@@ -615,7 +615,7 @@ def build_plan_graph(
     transport = planner_transport
     gitlab_transport = gitlab
 
-    def _gitlab(state: WorkflowState):
+    def _gitlab():
         # The GitLab transport is created lazily so graphs that never reach
         # publication (blocked at setup) never construct one needlessly.
         if gitlab_transport is not None:
@@ -673,7 +673,7 @@ def build_plan_graph(
             "added_labels": ["agent::in-progress"],
         }
         try:
-            _gitlab(state).update_issue_labels(
+            _gitlab().update_issue_labels(
                 state["project"]["id"],
                 issue_iid,
                 remove_labels=["agent::plan"],
@@ -892,7 +892,7 @@ def build_plan_graph(
         context = state["operation_context"]
         evidence = state.get("inspection_evidence") or {}
         try:
-            notes = _gitlab(state).get_issue_notes(
+            notes = _gitlab().get_issue_notes(
                 state["project"]["id"], state["issue_iid"]
             )
         except _GITLAB_FAILURES as exc:
@@ -1030,7 +1030,7 @@ def build_plan_graph(
         publication = planning.build_publication_note(plan_dict)
         publication_uid = publication["publication_uid"]
         try:
-            notes = _gitlab(state).get_issue_notes(
+            notes = _gitlab().get_issue_notes(
                 state["project"]["id"], state["issue_iid"]
             )
         except _GITLAB_FAILURES as exc:
@@ -1047,7 +1047,7 @@ def build_plan_graph(
         created = existing
         if created is None:
             try:
-                created = _gitlab(state).add_issue_note(
+                created = _gitlab().add_issue_note(
                     state["project"]["id"], state["issue_iid"], publication["body"]
                 )
             except _GITLAB_FAILURES as exc:
@@ -1056,7 +1056,7 @@ def build_plan_graph(
                 # would risk a duplicate version, so an unresolvable outcome
                 # is a truthful publication failure (no repeated reposts).
                 try:
-                    reread = _gitlab(state).get_issue_notes(
+                    reread = _gitlab().get_issue_notes(
                         state["project"]["id"], state["issue_iid"]
                     )
                 except _GITLAB_FAILURES as rescan_exc:
@@ -1110,7 +1110,7 @@ def build_plan_graph(
             "added_labels": ["agent::needs-review"],
         }
         try:
-            _gitlab(state).update_issue_labels(
+            _gitlab().update_issue_labels(
                 state["project"]["id"],
                 state["issue_iid"],
                 remove_labels=["agent::in-progress"],
