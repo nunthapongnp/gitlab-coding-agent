@@ -27,6 +27,104 @@ TEST_COMMAND= # Override unit test command
 
 GIT_AUTHOR_NAME=agent-bot
 GIT_AUTHOR_EMAIL=ai@agent.bot
+
+# Ticket 03: per-operation storage and Planner worker endpoints
+WORKSPACE_ROOT=/workspaces        # per-operation workspace volume root (inside compose)
+ARTIFACT_ROOT=/artifacts          # per-operation artifact root (inside compose)
+CONTROL_ROOT=/control             # shared control volume (lock metadata; inside compose)
+PLANNER_AGENT_SERVER_URL=         # separately started Planner Agent Server worker (required for Plan)
+AGENT_SERVER_API_KEY=             # worker session key (X-Session-API-Key); never a GitLab credential
+PLANNER_WORKSPACE_MOUNT=/workspace # workspace root as mounted inside the planner (read-only)
+```
+
+## Tested package set
+
+The dependency lock is in `requirements.lock`. Tested, verified combination:
+
+- Container images build on **python:3.12-slim** (OpenHands requires 3.12+);
+  the planner Agent Server image was built and its server verified running by
+  the runtime probes on Python 3.12.
+- Host import and remote-workspace construction verification was performed on
+  **CPython 3.14.7** (macOS arm64) against the installed packages below.
+- `openhands-sdk==1.60.2`, `openhands-tools==1.60.2`,
+  `openhands-agent-server==1.60.2`, `openhands-workspace==1.60.2` — verified
+  by import and remote-workspace construction against the installed packages
+  (see `requirements.lock` header). Do not bump the OpenHands set casually.
+- Application/test deps are exact-pinned to the tested environment:
+  `langgraph==1.2.20`, `requests==2.34.2`, `python-dotenv==1.2.4`, `pytest==9.2.0`
+
+The configured `OLLAMA_MODEL` is normalized **once** at config load: stacked
+provider prefixes are collapsed (`openai/ollama/x` → `ollama/x`), a bare
+model name gets the default `ollama/` prefix, and invalid values fail with an
+actionable error. Configured values are honored; no second prefix is ever
+stacked downstream.
+
+## Operator launch (Docker runtime)
+
+The Docker runtime isolates roles per ADR 0002: the coordinator holds the
+GitLab token; the planner worker is a **separately started** OpenHands Agent
+Server that receives **no GitLab credentials and no host Docker socket**, and
+mounts the operation workspace **read-only**.
+
+POSIX:
+
+```bash
+scripts/launch.sh --project "my-group/my-project" --issue 12 [--branch release/1.4]
+```
+
+Windows PowerShell:
+
+```powershell
+scripts/launch.ps1 --project "my-group/my-project" --issue 12 [--branch release/1.4]
+```
+
+Both launchers do exactly the same thing:
+
+1. Generate a unique `OPERATION_ID` (or reuse one you exported).
+2. Start a **distinct Compose project** `gitlab-agent-${OPERATION_ID}` —
+   per-operation workspace volume, fresh SDK context, distinct artifact
+   directory. Two launches never share operation storage or contexts.
+3. Forward **all CLI arguments unchanged** to the same `python main.py …`
+   invocation inside the coordinator container.
+4. Keep artifacts on the host at
+   `${AGENT_ARTIFACT_DIR:-~/.gitlab-coding-agent/artifacts}/<operation-id>`
+   — outside the product checkout.
+
+### Credential isolation summary
+
+| Credential | Coordinator | Planner worker |
+|---|---|---|
+| `GITLAB_TOKEN` | yes | **never** |
+| Host Docker socket | no | **never** |
+| Agent Server session key (`AGENT_SERVER_API_KEY`) | holds; sends as `X-Session-API-Key` | verifies (its own worker credential) |
+| Model endpoint (`OLLAMA_*`) | builds the LLM config | calls the model (read toolset only) |
+
+The planner workspace mount is read-only; repository writes fail at the
+filesystem level (probe-verified, see `tests/test_runtime_probes.py`).
+
+### Retention and cleanup policy (manual — never automatic)
+
+Nothing is deleted, reset, or restored automatically — not on success, not
+on failure. A failed launch retains its compose project, workspace volume,
+and `AGENT_ARTIFACT_DIR/<operation-id>` logs/evidence for inspection. The
+launchers never run `docker compose down --volumes` and never remove volumes.
+
+Explicit operator cleanup for a finished launch you no longer need:
+
+```bash
+docker compose -p gitlab-agent-<operation-id> down      # containers only; volumes are kept
+docker volume rm gitlab-agent-<operation-id>_workspace  # only if you want that workspace gone
+```
+
+The shared control volume `gitlab-agent-control` (Issue/branch lock metadata)
+persists across all launches and is never deleted; lock records are retained
+with release markers.
+
+## Runtime probes (opt-in)
+
+```bash
+pytest -m runtime_probe -q   # requires a running Docker daemon
+pytest -q                    # offline suite; probes are deselected by default
 ```
 
 ## Run on local

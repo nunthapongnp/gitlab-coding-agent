@@ -4,16 +4,16 @@
 
 **Blocked by:** 02: Route Issue requests by validated labels.
 
-**Status:** draft (pending breakdown review)
+**Status:** done — implemented on feature/p0-ticket-03 (231ec93..e00c5c6; PR to develop pending)
 
-- [ ] Host launchers support Windows and POSIX operators while wrapping the same application invocation; pin a tested compatible Python/OpenHands package set.
-- [ ] A trusted coordinator uses a separately started remote Planner worker; the worker has no coordinator GitLab credentials or host Docker socket.
-- [ ] Two launches receive different operation identifiers, workspace volumes, SDK contexts, and external artifact locations and independently inspect the clone.
-- [ ] Real runtime probes prove repository writes fail for the Planner and it cannot reach a writable coding endpoint with granted credentials.
-- [ ] A shared control volume provides the Issue lock; concurrent ownership is rejected and lock acquisition order is stable.
-- [ ] Default/explicit-baseline inspection produces observable module/source/configuration evidence through the workflow/runtime probe; missing endpoint/toolchain setup fails clearly.
-- [ ] Configured Ollama model/provider values are honored and normalized once; worker connectivity is demonstrated rather than assumed.
-- [ ] Failure retains available logs/workspace evidence and never restores an earlier context or deletes/reset volumes automatically.
+- [x] Host launchers support Windows and POSIX operators while wrapping the same application invocation; pin a tested compatible Python/OpenHands package set.
+- [x] A trusted coordinator uses a separately started remote Planner worker; the worker has no coordinator GitLab credentials or host Docker socket.
+- [x] Two launches receive different operation identifiers, workspace volumes, SDK contexts, and external artifact locations and independently inspect the clone.
+- [x] Real runtime probes prove repository writes fail for the Planner and it cannot reach a writable coding endpoint with granted credentials.
+- [x] A shared control volume provides the Issue lock; concurrent ownership is rejected and lock acquisition order is stable.
+- [x] Default/explicit-baseline inspection produces observable module/source/configuration evidence through the workflow/runtime probe; missing endpoint/toolchain setup fails clearly.
+- [x] Configured Ollama model/provider values are honored and normalized once; worker connectivity is demonstrated rather than assumed.
+- [x] Failure retains available logs/workspace evidence and never restores an earlier context or deletes/reset volumes automatically.
 
 **Source specifications:** P0-SPEC-003, P0-SPEC-004.
 

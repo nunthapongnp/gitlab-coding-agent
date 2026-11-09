@@ -1,12 +1,21 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
 from .config import Settings
 from .gitlab_client import GitLabClient
+from .workspace import OperationContext, OperationLock, OperationWorkspaceError
+
+__all__ = [
+    "route_issue_request",
+    "run_routed_workflow",
+    "build_plan_graph",
+    "build_execute_graph",
+]
 
 # Recognized agent labels per implementation plan section 3.2. Only these
 # labels drive routing; every other label (agent-like or not) is unrelated and
@@ -25,8 +34,16 @@ MODE_EXECUTE = "execute"
 
 STATUS_ROUTED = "routed"
 STATUS_REJECTED = "rejected"
-STATUS_PLAN_UNAVAILABLE = "plan_unavailable"
 STATUS_EXECUTE_UNAVAILABLE = "execute_unavailable"
+STATUS_INSPECTION_COMPLETE = "inspection_complete"
+STATUS_INSPECTION_FAILED = "inspection_failed"
+STATUS_INSPECTION_BLOCKED = "inspection_blocked"
+STATUS_OPERATION_LOCKED = "operation_locked"
+
+# Terminal Plan-side inspection outcomes (graph returns instead of raising).
+INSPECTION_TERMINAL_STATUSES = frozenset(
+    {STATUS_INSPECTION_COMPLETE, STATUS_INSPECTION_FAILED, STATUS_INSPECTION_BLOCKED}
+)
 
 # Read-only transport surface used by routing. Anything else (label writes,
 # MR creation, merges, approvals, user/role lookups) must never be called.
@@ -50,6 +67,14 @@ class WorkflowState(TypedDict, total=False):
     source_branch: str
     verification_hints: dict[str, str | None]
     message: str
+    # Ticket 03 Plan-inspection fields (all optional).
+    operation: dict[str, Any]
+    operation_context: OperationContext  # concrete object (no circular import)
+    locks: list[OperationLock]  # released OperationLock objects
+    workspace_repo_dir: str
+    evidence_path: str
+    inspection_evidence: dict[str, Any]
+    error_message: str
 
 
 class RoutingRejection(RuntimeError):
@@ -320,9 +345,10 @@ def _unavailable_mode_graph(
 ):
     """Compile a mode graph that fails clearly instead of doing product work.
 
-    The real Plan/Execute graphs arrive in later tickets. Until then the
-    routed request is validated, then reported as an infrastructure error with
-    a distinct structured status and no product edits or publication.
+    The Execute graph (and Plan publication) arrive in later tickets. Until
+    then a routed request is validated, then reported as an infrastructure
+    error with a distinct structured status and no product edits or
+    publication.
     """
 
     def not_available(state: WorkflowState) -> dict[str, Any]:
@@ -333,21 +359,6 @@ def _unavailable_mode_graph(
     builder.add_edge(START, node_name)
     builder.add_edge(node_name, END)
     return builder.compile()
-
-
-def build_plan_graph(settings: Settings):
-    """Compile the Plan-mode graph (not implemented yet in this transition)."""
-    return _unavailable_mode_graph(
-        settings,
-        mode=MODE_PLAN,
-        status=STATUS_PLAN_UNAVAILABLE,
-        node_name="plan_unavailable",
-        message=(
-            "Plan preparation is not implemented yet in this transition: the "
-            "request was validated and routed to Plan, but there is no planning "
-            "graph to run. Nothing was edited or published."
-        ),
-    )
 
 
 def build_execute_graph(settings: Settings):
@@ -363,6 +374,239 @@ def build_execute_graph(settings: Settings):
             "run. Nothing was edited or published."
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# Plan-side inspection graph (ticket 03)
+# ---------------------------------------------------------------------------
+
+def _worker_working_dir(operation: OperationContext, repo_dir: Path, settings: Settings) -> str:
+    """Translate the coordinator clone path into the planner worker's path.
+
+    The planner mounts the per-operation workspace root read-only at
+    ``PLANNER_WORKSPACE_MOUNT`` (default ``/workspace`` in compose), so the
+    clone lives at ``<mount>/<operation-id>/repo`` inside the worker.
+
+    Raises ``OperationWorkspaceError`` when the clone is not under the
+    configured ``WORKSPACE_ROOT``: the worker path could not be derived, and
+    silently pointing the planner at the mount root would inspect the wrong
+    directory.
+    """
+    mount = (settings.planner_workspace_mount or "/workspace").rstrip("/")
+    root = Path(settings.workspace_root).expanduser().resolve()
+    try:
+        relative = Path(repo_dir).resolve().relative_to(root)
+    except ValueError:
+        raise OperationWorkspaceError(
+            f"Inspection clone {Path(repo_dir).resolve()} is not under the "
+            f"configured WORKSPACE_ROOT ({root}), so the planner worker "
+            f"working directory cannot be derived for operation "
+            f"{operation.operation_id}. Fix WORKSPACE_ROOT / "
+            "PLANNER_WORKSPACE_MOUNT so the coordinator workspace root and "
+            "the planner's read-only mount describe the same location; "
+            "nothing was edited or published."
+        ) from None
+    return f"{mount}/{relative}"
+
+
+def build_plan_graph(
+    settings: Settings,
+    *,
+    operation_factory=None,
+    planner_transport=None,
+    clone_fn=None,
+):
+    """Compile the read-only Plan inspection graph.
+
+    Flow: validate setup → create operation context (unique id, fresh
+    workspace/artifact references) → acquire the Issue lock on the shared
+    control volume (concurrent ownership rejects immediately) → prepare a
+    fresh inspection clone at the baseline branch → run the read-only
+    Planner through the injectable transport → record module/source/
+    configuration evidence in artifact storage (outside the checkout).
+
+    Plan synthesis/publication is deliberately NOT implemented here (ticket
+    04). The graph stops at ``inspection_complete`` or a clearly failed/
+    blocked state; failures retain all available evidence and release the
+    lock. Nothing is ever deleted or reset.
+
+    Injection seams keep offline tests free of Docker/LLM/GitLab:
+    - ``operation_factory(settings) -> OperationContext``
+    - ``planner_transport``: a ``PlannerTransport`` (remote adapter by default)
+    - ``clone_fn``: defaults to ``git_ops.clone_repository``
+    """
+    from .git_ops import GitOperationError, clone_repository
+    from .planner_runner import (
+        PlannerRunError,
+        PlannerSetupError,
+        build_inspection_evidence,
+        make_planner_prompt,
+        record_evidence,
+    )
+    from .workspace import (
+        OperationWorkspaceError,
+        acquire_issue_and_branch_locks,
+        create_operation_context as _default_operation_factory,
+        release_locks,
+    )
+
+    operation_factory = operation_factory or _default_operation_factory
+    clone_fn = clone_fn or clone_repository
+    transport = planner_transport
+
+    def validate_setup(state: WorkflowState) -> dict[str, Any]:
+        if not settings.planner_agent_server_url:
+            return {
+                "status": STATUS_INSPECTION_BLOCKED,
+                "error_message": (
+                    "Plan inspection is not configured: PLANNER_AGENT_SERVER_URL "
+                    "is not set. Start the separately launched Planner Agent "
+                    "Server worker (compose service 'planner' via "
+                    "scripts/launch.sh or scripts/launch.ps1) and set "
+                    "PLANNER_AGENT_SERVER_URL (plus AGENT_SERVER_API_KEY when "
+                    "the worker requires a session key). Nothing was cloned, "
+                    "inspected, edited, or published."
+                ),
+            }
+        return {}
+
+    def create_operation(state: WorkflowState) -> dict[str, Any]:
+        try:
+            operation = operation_factory(settings)
+        except OperationWorkspaceError as exc:
+            return {
+                "status": STATUS_INSPECTION_FAILED,
+                "error_message": str(exc),
+            }
+        return {"operation": operation.describe(), "operation_context": operation}
+
+    def acquire_issue_lock(state: WorkflowState) -> dict[str, Any]:
+        context = state["operation_context"]
+        # Concurrent ownership is rejected immediately (no waiting). The
+        # exception propagates to the application boundary (exit 2): nothing
+        # was started, edited, or published.
+        locks = acquire_issue_and_branch_locks(
+            Path(settings.control_root).expanduser(),
+            operation_id=context.operation_id,
+            gitlab_url=settings.gitlab_url,
+            project_id=state["project"]["id"],
+            issue_iid=state["issue_iid"],
+        )
+        return {"locks": locks}
+
+    def prepare_inspection_clone(state: WorkflowState) -> dict[str, Any]:
+        context = state["operation_context"]
+        repo_url = state["project"].get("http_url_to_repo")
+        if not repo_url:
+            return {
+                "status": STATUS_INSPECTION_FAILED,
+                "error_message": (
+                    "GitLab project did not report an 'http_url_to_repo', so a "
+                    "fresh inspection clone cannot be prepared. Nothing was "
+                    "edited or published; retained artifacts stay in place."
+                ),
+            }
+        destination = context.workspace_path / "repo"
+        try:
+            clone_fn(
+                repo_url,
+                destination,
+                settings.gitlab_token,
+                branch=state["baseline_branch"],
+            )
+        except GitOperationError as exc:
+            return {
+                "status": STATUS_INSPECTION_FAILED,
+                "error_message": (
+                    f"Fresh inspection clone of {repo_url} at branch "
+                    f"{state['baseline_branch']} failed: {exc}. Workspace and "
+                    "artifact evidence are retained; nothing was edited or "
+                    "published."
+                ),
+            }
+        return {"workspace_repo_dir": str(destination)}
+
+    def inspect_repository(state: WorkflowState) -> dict[str, Any]:
+        context = state["operation_context"]
+        repo_dir = Path(state["workspace_repo_dir"])
+        prompt = make_planner_prompt(
+            state["issue"], state["project"], state["baseline_branch"], context
+        )
+        try:
+            planner_result = transport.run(
+                prompt=prompt,
+                repo_dir=repo_dir,
+                worker_working_dir=_worker_working_dir(context, repo_dir, settings),
+                operation=context,
+                settings=settings,
+            )
+        except PlannerSetupError as exc:
+            return {
+                "status": STATUS_INSPECTION_BLOCKED,
+                "error_message": str(exc),
+            }
+        except PlannerRunError as exc:
+            # Keep the deterministic coordinator-side evidence collected so
+            # far and record the planner failure honestly.
+            evidence = build_inspection_evidence(
+                operation=context,
+                repo_dir=repo_dir,
+                baseline_branch=state["baseline_branch"],
+                verification_hints=state.get("verification_hints"),
+                planner_result={"status": "failed", "error": str(exc)},
+            )
+            evidence_path = record_evidence(context.artifact_path, evidence)
+            return {
+                "status": STATUS_INSPECTION_FAILED,
+                "error_message": str(exc),
+                "inspection_evidence": evidence.to_dict(),
+                "evidence_path": str(evidence_path),
+            }
+        evidence = build_inspection_evidence(
+            operation=context,
+            repo_dir=repo_dir,
+            baseline_branch=state["baseline_branch"],
+            verification_hints=state.get("verification_hints"),
+            planner_result=planner_result,
+        )
+        evidence_path = record_evidence(context.artifact_path, evidence)
+        return {
+            "status": STATUS_INSPECTION_COMPLETE,
+            "inspection_evidence": evidence.to_dict(),
+            "evidence_path": str(evidence_path),
+        }
+
+    def finalize_inspection(state: WorkflowState) -> dict[str, Any]:
+        # Release locks (reverse order). Retained evidence is never deleted.
+        release_locks(state.get("locks") or [])
+        return {"message": state.get("error_message") or "Inspection complete."}
+
+    builder = StateGraph(WorkflowState)
+    builder.add_node("validate_setup", validate_setup)
+    builder.add_node("create_operation", create_operation)
+    builder.add_node("acquire_issue_lock", acquire_issue_lock)
+    builder.add_node("prepare_inspection_clone", prepare_inspection_clone)
+    builder.add_node("inspect_repository", inspect_repository)
+    builder.add_node("finalize_inspection", finalize_inspection)
+
+    def route_after(node_name: str, next_node: str):
+        def router(state: WorkflowState) -> str:
+            if state.get("status") in INSPECTION_TERMINAL_STATUSES:
+                return "finalize_inspection"
+            return next_node
+
+        builder.add_conditional_edges(node_name, router, ["finalize_inspection", next_node])
+
+    builder.add_edge(START, "validate_setup")
+    route_after("validate_setup", "create_operation")
+    route_after("create_operation", "acquire_issue_lock")
+    # Lock acquisition raises ConcurrentOperationError on conflict (it must
+    # propagate); after it, terminal routing covers clone/inspection failures.
+    route_after("acquire_issue_lock", "prepare_inspection_clone")
+    route_after("prepare_inspection_clone", "inspect_repository")
+    route_after("inspect_repository", "finalize_inspection")
+    builder.add_edge("finalize_inspection", END)
+    return builder.compile()
 
 
 def run_routed_workflow(
