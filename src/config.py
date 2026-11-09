@@ -126,6 +126,10 @@ class Settings:
     # and are never forwarded to the worker itself.
     planner_agent_server_url: str | None = None
     agent_server_api_key: str | None = None
+    # Path at which the per-operation workspace root is mounted INSIDE the
+    # planner container (the planner mounts it read-only). Used to translate
+    # coordinator clone paths into worker working directories.
+    planner_workspace_mount: str | None = None
 
     @classmethod
     def from_env(cls, output_dir: Path | None = None) -> "Settings":
@@ -165,4 +169,5 @@ class Settings:
             control_root=_path_env("CONTROL_ROOT", default_control_root),
             planner_agent_server_url=_url_env("PLANNER_AGENT_SERVER_URL"),
             agent_server_api_key=os.getenv("AGENT_SERVER_API_KEY") or None,
+            planner_workspace_mount=(os.getenv("PLANNER_WORKSPACE_MOUNT") or "").strip() or None,
         )

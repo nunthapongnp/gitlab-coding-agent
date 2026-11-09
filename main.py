@@ -113,6 +113,10 @@ def main() -> int:
         return 2
 
     from src.workflow import (
+        STATUS_INSPECTION_BLOCKED,
+        STATUS_INSPECTION_FAILED,
+        STATUS_OPERATION_LOCKED,
+        ConcurrentOperationError,
         RoutingRejection,
         WorkflowUnavailableError,
         run_routed_workflow,
@@ -129,6 +133,12 @@ def main() -> int:
             issue_iid=args.issue,
             branch_override=args.branch,
         )
+    except ConcurrentOperationError as exc:
+        # Another live invocation owns this Issue; reject immediately (exit 2)
+        # without waiting, stealing, or cleaning up the other operation.
+        print(f"OPERATION LOCKED: {exc}", file=sys.stderr)
+        _save_report(args, settings, mode=None, status=STATUS_OPERATION_LOCKED, message=str(exc))
+        return 2
     except RoutingRejection as exc:
         print(f"REJECTED: {exc}", file=sys.stderr)
         _save_report(args, settings, mode=exc.mode, status=exc.status, message=str(exc))
@@ -145,20 +155,49 @@ def main() -> int:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
-    # Fully successful workflow plus finalization (not reachable yet in this
-    # transition: the mode graphs fail clearly until later tickets).
+    # Inspection outcomes: complete vs failed/blocked have distinct exit codes.
+    status = result.get("status")
+    if status in (STATUS_INSPECTION_FAILED, STATUS_INSPECTION_BLOCKED):
+        message = result.get("error_message") or status
+        print(f"ERROR: {message}", file=sys.stderr)
+        _save_report(
+            args,
+            settings,
+            mode=result.get("mode"),
+            status=status,
+            message=message,
+            extra={"operation_id": (result.get("operation") or {}).get("operation_id")},
+        )
+        return 1
+
+    # Fully successful workflow plus finalization.
     issue = result.get("issue", {})
     print("\n=== Routing ===")
     print(f"Mode    : {result.get('mode')}")
     print(f"Issue   : #{issue.get('iid', args.issue)} — {issue.get('title', '(no title)')}")
-    print(f"Status  : {result.get('status')}")
+    print(f"Status  : {status}")
+    operation = result.get("operation") or {}
+    evidence = result.get("inspection_evidence") or {}
+    if operation:
+        print(f"Op ID   : {operation.get('operation_id')}")
+        print(f"Artifacts: {operation.get('artifact_path')}")
+        print(
+            "Inspection: "
+            f"{evidence.get('source_file_count', '?')} source files across "
+            f"{len(evidence.get('modules') or [])} modules; "
+            f"{len(evidence.get('config_files') or [])} config/manifest files"
+        )
     _save_report(
         args,
         settings,
         mode=result.get("mode"),
-        status=result.get("status"),
+        status=status,
         message=result.get("message"),
-        extra={"issue_iid": issue.get("iid", args.issue)},
+        extra={
+            "issue_iid": issue.get("iid", args.issue),
+            "operation_id": operation.get("operation_id"),
+            "evidence_path": result.get("evidence_path"),
+        },
     )
     return 0
 

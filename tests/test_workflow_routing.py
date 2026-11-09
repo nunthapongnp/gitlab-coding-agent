@@ -29,6 +29,7 @@ from src.workflow import (
     MODE_PLAN,
     ROUTING_READ_CALLS,
     STATUS_EXECUTE_UNAVAILABLE,
+    STATUS_INSPECTION_BLOCKED,
     STATUS_PLAN_UNAVAILABLE,
     STATUS_REJECTED,
     RoutingRejection,
@@ -532,17 +533,20 @@ class TestRoutedWorkflowDispatch:
         # Execute state carries the MR source branch, not a Plan baseline.
         assert "baseline_branch" not in state
 
-    def test_default_plan_graph_fails_clearly_as_infrastructure_error(self, settings):
+    def test_default_plan_graph_blocks_clearly_without_worker_endpoint(
+        self, settings
+    ):
         transport = FakeGitLabTransport(make_project(), make_issue(["agent::plan"]))
 
-        with pytest.raises(WorkflowUnavailableError) as excinfo:
-            run_routed_workflow(
-                settings, project_id="group/demo", issue_iid=7, gitlab=transport
-            )
+        result = run_routed_workflow(
+            settings, project_id="group/demo", issue_iid=7, gitlab=transport
+        )
 
-        assert excinfo.value.status == STATUS_PLAN_UNAVAILABLE
-        assert excinfo.value.mode == MODE_PLAN
-        assert "not implemented" in str(excinfo.value)
+        # The default plan graph now performs setup validation first: with no
+        # planner worker endpoint configured it fails clearly (blocked) before
+        # any clone, inspection, edit, or publication happens.
+        assert result["status"] == STATUS_INSPECTION_BLOCKED
+        assert "PLANNER_AGENT_SERVER_URL" in result["error_message"]
         # No product work: only routing reads happened.
         transport.assert_only_reads()
 
@@ -621,7 +625,7 @@ class TestApplicationBoundary:
             str(tmp_path / "runs"),
         ]
 
-    def test_plan_request_reports_unavailable_downstream_with_exit_1(
+    def test_plan_request_without_worker_endpoint_blocks_with_exit_1(
         self, tmp_path, monkeypatch, capsys
     ):
         transport = FakeGitLabTransport(make_project(), make_issue(["agent::plan"]))
@@ -631,11 +635,12 @@ class TestApplicationBoundary:
         )
 
         assert code == 1
-        assert "not implemented" in err
-        assert "plan_unavailable" in out
+        # The actionable message names the missing configuration.
+        assert "PLANNER_AGENT_SERVER_URL" in err
         report = json.loads((tmp_path / "runs" / "poc-result.json").read_text())
         assert report["mode"] == "plan"
-        assert report["status"] == "plan_unavailable"
+        assert report["status"] == "inspection_blocked"
+        assert "PLANNER_AGENT_SERVER_URL" in report["message"]
         assert used.read_calls() == ["get_project", "get_issue"]
         used.assert_only_reads()
 
@@ -718,11 +723,11 @@ class TestApplicationBoundary:
         code = main_module.main()
         captured = capsys.readouterr()
 
-        assert code == 1  # plan_unavailable; routing itself succeeded
+        assert code == 1  # inspection blocked on missing worker endpoint; routing succeeded
         assert seen_overrides == ["release/1.4"]
         report = json.loads((tmp_path / "runs" / "poc-result.json").read_text())
         assert report["branch_override"] == "release/1.4"
-        assert report["status"] == "plan_unavailable"
+        assert report["status"] == "inspection_blocked"
 
     def test_branch_override_rejected_for_execute(
         self, tmp_path, monkeypatch, capsys
