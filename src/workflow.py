@@ -158,6 +158,75 @@ def _reject_issue_state(issue_iid: int, labels: list[str]) -> RoutingRejection:
     return RoutingRejection(message)
 
 
+def _reject_mr(mr: dict[str, Any], issue_iid: int, problem: str, advice: str) -> RoutingRejection:
+    return RoutingRejection(
+        f"Open merge request !{mr.get('iid', '?')} related to Issue "
+        f"#{issue_iid} {problem} {advice}",
+        mode=MODE_EXECUTE,
+    )
+
+
+def _select_implement_mr(
+    project: dict[str, Any], issue_iid: int, open_mrs: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Validate the single open related MR required for Execute preflight."""
+    mr = open_mrs[0]
+    issue_project_id = project.get("id")
+    if not isinstance(issue_project_id, int):
+        raise RoutingRejection(
+            f"GitLab project {project.get('path_with_namespace', '?')} did not "
+            "report its numeric project ID, so the merge request's origin "
+            "cannot be verified against the Issue project. Execute requires "
+            "the merge request to live within the Issue project.",
+            mode=MODE_EXECUTE,
+        )
+    # A fork MR keeps the Issue project as its target while its source lives
+    # in another project; every project identity on the MR must equal the
+    # Issue project. Missing identities reject rather than pass silently.
+    for key in ("source_project_id", "target_project_id", "project_id"):
+        mr_project_id = mr.get(key)
+        if mr_project_id != issue_project_id:
+            raise _reject_mr(
+                mr,
+                issue_iid,
+                f"belongs to project {mr_project_id!r} "
+                f"({key}), not the Issue project {issue_project_id}.",
+                "Execute requires a merge request within the Issue project "
+                "(no forks); close it and create one in the Issue project "
+                "labeled agent::implement.",
+            )
+
+    mr_labels = [str(label) for label in (mr.get("labels") or [])]
+    mr_recognized = _recognized_labels(mr_labels, MR_AGENT_STATES)
+    if len(mr_recognized) > 1:
+        raise _reject_mr(
+            mr,
+            issue_iid,
+            f"carries conflicting agent labels: "
+            f"{_describe_labels(sorted(mr_recognized))}. At most one recognized "
+            f"MR agent state is allowed ({_describe_labels(sorted(MR_AGENT_STATES))}).",
+            "Remove the extra agent labels so the MR carries only "
+            "agent::implement, and retry.",
+        )
+    if not mr_recognized:
+        raise _reject_mr(
+            mr,
+            issue_iid,
+            f"is not labeled agent::implement (labels: {_describe_labels(mr_labels)}).",
+            "Label it agent::implement to request Execute, and retry.",
+        )
+    if mr_recognized[0] != EXECUTE_TRIGGER:
+        raise _reject_mr(
+            mr,
+            issue_iid,
+            f"is labeled {mr_recognized[0]}; an in-progress or needs-review "
+            "merge request is not a request to execute.",
+            "Wait for the current transition to finish, or reset the MR "
+            "label to agent::implement and retry.",
+        )
+    return mr
+
+
 def route_issue_request(
     *,
     gitlab: Any,
@@ -234,53 +303,7 @@ def route_issue_request(
             mode=MODE_EXECUTE,
         )
 
-    mr = open_mrs[0]
-    issue_project_id = project.get("id")
-    for key in ("project_id", "target_project_id"):
-        mr_project_id = mr.get(key)
-        if (
-            mr_project_id is not None
-            and issue_project_id is not None
-            and mr_project_id != issue_project_id
-        ):
-            raise RoutingRejection(
-                f"Open merge request !{mr.get('iid', '?')} related to Issue "
-                f"#{issue_iid} belongs to project {mr_project_id}, not the Issue "
-                f"project {issue_project_id}. Execute requires a merge request "
-                "within the Issue project; close it and create one in the Issue "
-                "project labeled agent::implement.",
-                mode=MODE_EXECUTE,
-            )
-
-    mr_labels = [str(label) for label in (mr.get("labels") or [])]
-    mr_recognized = _recognized_labels(mr_labels, MR_AGENT_STATES)
-    if len(mr_recognized) > 1:
-        raise RoutingRejection(
-            f"Open merge request !{mr.get('iid', '?')} related to Issue "
-            f"#{issue_iid} carries conflicting agent labels: "
-            f"{_describe_labels(sorted(mr_recognized))}. At most one recognized "
-            f"MR agent state is allowed ({_describe_labels(sorted(MR_AGENT_STATES))}). "
-            "Remove the extra agent labels so the MR carries only agent::implement, "
-            "and retry.",
-            mode=MODE_EXECUTE,
-        )
-    if not mr_recognized:
-        raise RoutingRejection(
-            f"Open merge request !{mr.get('iid', '?')} related to Issue "
-            f"#{issue_iid} is not labeled agent::implement "
-            f"(labels: {_describe_labels(mr_labels)}). Label it agent::implement "
-            "to request Execute, and retry.",
-            mode=MODE_EXECUTE,
-        )
-    if mr_recognized[0] != EXECUTE_TRIGGER:
-        raise RoutingRejection(
-            f"Open merge request !{mr.get('iid', '?')} related to Issue "
-            f"#{issue_iid} is labeled {mr_recognized[0]}; an in-progress or "
-            "needs-review merge request is not a request to execute. Wait for "
-            "the current transition to finish, or reset the MR label to "
-            "agent::implement and retry.",
-            mode=MODE_EXECUTE,
-        )
+    mr = _select_implement_mr(project, issue_iid, open_mrs)
 
     return RoutingResult(
         mode=MODE_EXECUTE,

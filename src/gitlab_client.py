@@ -126,6 +126,9 @@ class GitLabClient:
                 break
             page = following
         else:
+            # Reached only when the while condition failed, i.e. every
+            # ``max_pages`` pages were consumed while more pages kept
+            # arriving — a bounded failure, not a silent truncation.
             raise GitLabAPIError(
                 f"GitLab Issue merge-request listing exceeded {max_pages} pages; "
                 "refusing to continue without inspecting every related MR."

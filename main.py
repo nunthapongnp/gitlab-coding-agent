@@ -9,6 +9,17 @@ from pathlib import Path
 from src.config import Settings
 
 
+# Obsolete branch/MR-creation controls: the agent no longer creates branches
+# or merge requests, so these flags get an actionable removal error instead of
+# a generic "unrecognized arguments" one.
+OBSOLETE_MR_CREATION_FLAGS = (
+    "--target-branch",
+    "--mr-title",
+    "--mr-description",
+    "--draft-mr",
+)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="GitLab issue → label-routed coding agent (Plan/Execute preparation)"
@@ -25,7 +36,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--build-command", help="Optional build command hint")
     parser.add_argument("--test-command", help="Optional unit test command hint")
     parser.add_argument("--max-fix-attempts", type=int, help="Maximum repair loops after initial implementation")
-    return parser.parse_args()
+    args, unknown = parser.parse_known_args()
+    for flag in OBSOLETE_MR_CREATION_FLAGS:
+        for token in unknown:
+            if token == flag or token.startswith(flag + "="):
+                parser.error(
+                    f"{flag} was removed: the agent no longer creates branches or "
+                    "merge requests and never merges. Create your own source "
+                    "branch and one merge request in the Issue project, label it "
+                    "agent::implement, and retry."
+                )
+    if unknown:
+        parser.error(f"unrecognized arguments: {' '.join(unknown)}")
+    return args
 
 
 def _load_settings(args: argparse.Namespace) -> Settings:

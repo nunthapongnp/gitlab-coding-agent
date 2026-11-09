@@ -90,6 +90,7 @@ def make_mr(
     source_branch: str = "feature/greeting",
     project_id: int = 101,
     target_project_id: int = 101,
+    source_project_id: int | None = 101,
 ) -> dict:
     return {
         "iid": iid,
@@ -99,6 +100,7 @@ def make_mr(
         "target_branch": "main",
         "project_id": project_id,
         "target_project_id": target_project_id,
+        "source_project_id": source_project_id,
         "web_url": f"http://gitlab.invalid/group/demo/-/merge_requests/{iid}",
     }
 
@@ -341,7 +343,9 @@ class TestLabelRoutingExecute:
         assert result.mr["iid"] == 9
 
     def test_approved_rejects_cross_project_mr(self, settings):
-        mr = make_mr(project_id=999, target_project_id=999)
+        mr = make_mr(
+            project_id=999, target_project_id=999, source_project_id=999
+        )
         transport = FakeGitLabTransport(
             make_project(), make_issue(["agent::approved"]), issue_mrs=[mr]
         )
@@ -352,6 +356,40 @@ class TestLabelRoutingExecute:
         message = str(excinfo.value)
         assert "999" in message and "101" in message
         assert "same" in message.lower() or "within" in message.lower()
+
+    def test_approved_rejects_fork_mr_targeting_issue_project(self, settings):
+        # A fork MR targets the Issue project but its source lives elsewhere;
+        # all project identities on the MR must equal the Issue project.
+        mr = make_mr(
+            project_id=101,
+            target_project_id=101,
+            source_project_id=999,
+        )
+        transport = FakeGitLabTransport(
+            make_project(), make_issue(["agent::approved"]), issue_mrs=[mr]
+        )
+
+        with pytest.raises(RoutingRejection) as excinfo:
+            route(transport)
+
+        message = str(excinfo.value)
+        assert "999" in message and "101" in message
+        assert "fork" in message.lower()
+        assert excinfo.value.mode == MODE_EXECUTE
+
+    def test_approved_rejects_mr_with_missing_project_identity(self, settings):
+        # A missing project identity must reject, never pass silently.
+        mr = make_mr()
+        del mr["source_project_id"]
+        transport = FakeGitLabTransport(
+            make_project(), make_issue(["agent::approved"]), issue_mrs=[mr]
+        )
+
+        with pytest.raises(RoutingRejection) as excinfo:
+            route(transport)
+
+        assert "source_project_id" in str(excinfo.value)
+        assert excinfo.value.mode == MODE_EXECUTE
 
 
 class TestLabelRoutingRejections:
@@ -709,10 +747,27 @@ class TestApplicationBoundary:
         "obsolete_flag",
         ["--target-branch", "--mr-title", "--mr-description", "--draft-mr"],
     )
-    def test_obsolete_flags_produce_argparse_exit_2(
+    def test_obsolete_flags_produce_actionable_exit_2(
         self, tmp_path, monkeypatch, capsys, obsolete_flag
     ):
         argv = self.base_argv(tmp_path) + [obsolete_flag, "unused-value"]
+
+        monkeypatch.setattr(sys, "argv", argv)
+        import main as main_module
+
+        with pytest.raises(SystemExit) as excinfo:
+            main_module.main()
+
+        err = capsys.readouterr().err
+        assert excinfo.value.code == 2
+        assert obsolete_flag in err
+        assert "no longer creates" in err
+        assert "agent::implement" in err
+
+    def test_other_unknown_flags_still_report_unrecognized(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        argv = self.base_argv(tmp_path) + ["--mode", "execute"]
 
         monkeypatch.setattr(sys, "argv", argv)
         import main as main_module
