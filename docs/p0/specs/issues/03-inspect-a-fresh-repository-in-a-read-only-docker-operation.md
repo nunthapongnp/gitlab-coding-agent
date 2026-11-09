@@ -4,7 +4,7 @@
 
 **Blocked by:** 02: Route Issue requests by validated labels.
 
-**Status:** draft (pending breakdown review)
+**Status:** in progress — feature/p0-ticket-03
 
 - [ ] Host launchers support Windows and POSIX operators while wrapping the same application invocation; pin a tested compatible Python/OpenHands package set.
 - [ ] A trusted coordinator uses a separately started remote Planner worker; the worker has no coordinator GitLab credentials or host Docker socket.
