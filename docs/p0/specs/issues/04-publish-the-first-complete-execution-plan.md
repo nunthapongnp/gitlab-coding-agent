@@ -4,7 +4,7 @@
 
 **Blocked by:** 03: Inspect a fresh repository in a read-only Docker operation.
 
-**Status:** draft (pending breakdown review)
+**Status:** in-progress — implemented on feature/p0-ticket-04
 
 - [ ] Read Project/Issue data, all comment pages, and related MR context; preserve and use requirements beyond the first API page.
 - [ ] Select the agreed planning baseline: explicit override, default without MR, single-MR target, or unique open-MR target; ambiguous cases request an explicit branch.
