@@ -68,7 +68,6 @@ PLAN_FAILURE_TERMINAL_STATUSES = frozenset(
 # MR creation, merges, approvals, user/role lookups) must never be called.
 ROUTING_READ_CALLS = frozenset({"get_project", "get_issue", "get_issue_merge_requests"})
 
-PLAN_MARKER = "gca-execution-plan:v1"  # recognized plan-comment marker (§5.3)
 _PLAN_JSON_FENCE_RE = re.compile(r"```json\s*(.*?)\s*```", re.DOTALL)
 
 
