@@ -7,6 +7,18 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 
+def _int_env(name: str, default: str, minimum: int) -> int:
+    """Read an integer env var, raising an actionable error when malformed."""
+    raw = os.getenv(name, default)
+    try:
+        return max(minimum, int(raw))
+    except ValueError:
+        raise ValueError(
+            f"{name} must be an integer, got {raw!r}. "
+            f"Fix the environment value or set it to the default {default!r}."
+        ) from None
+
+
 @dataclass(frozen=True)
 class Settings:
     gitlab_url: str
@@ -36,10 +48,10 @@ class Settings:
             ollama_base_url=os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/"),
             ollama_model=os.getenv("OLLAMA_MODEL", "gemma4:e4b"),
             ollama_api_key=os.getenv("OLLAMA_API_KEY", "ollama"),
-            max_iterations=max(1, int(os.getenv("OPENHANDS_MAX_ITERATIONS", "35"))),
-            timeout_seconds=max(1, int(os.getenv("OPENHANDS_TIMEOUT_SECONDS", "1800"))),
-            max_fix_attempts=max(0, int(os.getenv("MAX_FIX_ATTEMPTS", "3"))),
-            check_timeout_seconds=max(1, int(os.getenv("CHECK_TIMEOUT_SECONDS", "1200"))),
+            max_iterations=_int_env("OPENHANDS_MAX_ITERATIONS", "35", 1),
+            timeout_seconds=_int_env("OPENHANDS_TIMEOUT_SECONDS", "1800", 1),
+            max_fix_attempts=_int_env("MAX_FIX_ATTEMPTS", "3", 0),
+            check_timeout_seconds=_int_env("CHECK_TIMEOUT_SECONDS", "1200", 1),
             setup_command=(os.getenv("SETUP_COMMAND") or "").strip() or None,
             build_command=(os.getenv("BUILD_COMMAND") or "").strip() or None,
             test_command=(os.getenv("TEST_COMMAND") or "").strip() or None,

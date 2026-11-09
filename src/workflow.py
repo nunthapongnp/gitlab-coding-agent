@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TypedDict
@@ -9,14 +10,18 @@ from langgraph.graph import END, START, StateGraph
 from .checks import format_check_failures, run_build_and_test
 from .config import Settings
 from .git_ops import (
-    GitOperationError,
     clone_repository,
-    commit_and_push_branch,
-    create_issue_branch,
     get_working_tree_summary,
 )
-from .gitlab_client import GitLabAPIError, GitLabClient
+from .gitlab_client import GitLabClient
 from .openhands_runner import run_openhands
+
+# Injectable seams for the workflow. The defaults are the real implementations;
+# tests supply controlled fakes so no GitLab HTTP call or model call happens.
+GitLabTransport = Any  # duck-typed: GitLabClient's project/issue/MR methods
+AgentRunner = Callable[..., str]
+VerificationRunner = Callable[..., dict[str, Any]]
+Clock = Callable[[], datetime]
 
 
 class WorkflowState(TypedDict, total=False):
@@ -43,53 +48,75 @@ class WorkflowState(TypedDict, total=False):
     commit_sha: str
     merge_request: dict[str, Any]
     publish_error: str
+    published: bool
     status: str
 
 
-def _mr_description(state: WorkflowState, commit_sha: str) -> str:
-    issue = state["issue"]
-    issue_iid = issue.get("iid", state["issue_iid"])
-    issue_url = issue.get("web_url")
-    summary = (state.get("agent_result") or "").strip()
-    if len(summary) > 5000:
-        summary = summary[:5000] + "\n\n[Agent summary truncated]"
-    report = state.get("last_check_report") or {}
-    checks = report.get("checks") or {}
-    check_lines = []
-    for name in ("setup", "build", "test", "git_diff_check", "git_cached_diff_check"):
-        item = checks.get(name) or {}
-        if item:
-            check_lines.append(
-                f"- **{name}**: `{item.get('status', 'unknown')}` — `{item.get('command') or 'not configured'}`"
-            )
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
-    lines = [
-        f"Closes #{issue_iid}",
-        "",
-        "## Automated implementation summary",
-        summary
-        or "The coding agent did not provide a summary. Please inspect the diff.",
-        "",
-        "## Validation",
-        *check_lines,
-        "",
-        f"Repair attempts: {state.get('fix_attempts', 0)}",
-        f"Validation round: {report.get('round', 'unknown')}",
-        f"Commit: `{commit_sha[:12]}`",
-    ]
-    if issue_url:
-        lines.extend(["", f"Original issue: {issue_url}"])
-    lines.extend(
-        [
-            "",
-            "Please review the code diff and CI pipeline before merging. This POC never merges automatically.",
-        ]
+
+def build_graph(
+    settings: Settings,
+    *,
+    gitlab: GitLabTransport | None = None,
+    agent_runner: AgentRunner | None = None,
+    verification_runner: VerificationRunner | None = None,
+    clock: Clock | None = None,
+):
+    """Compile the transition workflow graph.
+
+    ``gitlab``, ``agent_runner``, ``verification_runner``, and ``clock`` are
+    injectable seams; each defaults to the real implementation. During the
+    transition the workflow never creates branches, pushes, or opens merge
+    requests: it fetches the issue, prepares a clone-only workspace, runs the
+    agent, runs verification with a bounded repair loop, and collects the
+    local diff.
+    """
+    gitlab = gitlab if gitlab is not None else GitLabClient(
+        settings.gitlab_url, settings.gitlab_token
     )
-    return "\n".join(lines)
 
+    def default_agent_runner(
+        *,
+        repo_dir: Path,
+        issue: dict[str, Any],
+        project: dict[str, Any],
+        branch: str,
+        repair_context: str | None = None,
+        repair_attempt: int | None = None,
+    ) -> str:
+        return run_openhands(
+            repo_dir=Path(repo_dir),
+            issue=issue,
+            project=project,
+            branch=branch,
+            settings=settings,
+            repair_context=repair_context,
+            repair_attempt=repair_attempt,
+        )
 
-def build_graph(settings: Settings):
-    gitlab = GitLabClient(settings.gitlab_url, settings.gitlab_token)
+    def default_verification_runner(
+        *,
+        repo_dir: Path,
+        run_dir: Path,
+        round_number: int,
+    ) -> dict[str, Any]:
+        return run_build_and_test(
+            repo_dir=Path(repo_dir),
+            run_dir=Path(run_dir),
+            setup_command=settings.setup_command,
+            build_command=settings.build_command,
+            test_command=settings.test_command,
+            timeout_seconds=settings.check_timeout_seconds,
+            round_number=round_number,
+        )
+
+    agent_runner = agent_runner if agent_runner is not None else default_agent_runner
+    verification_runner = (
+        verification_runner if verification_runner is not None else default_verification_runner
+    )
+    clock = clock if clock is not None else _utc_now
 
     def fetch_issue(state: WorkflowState) -> dict:
         project = gitlab.get_project(state["project_id"])
@@ -104,7 +131,7 @@ def build_graph(settings: Settings):
                 "GitLab project response did not include http_url_to_repo"
             )
 
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        stamp = clock().strftime("%Y%m%dT%H%M%S%fZ")
         project_slug = str(project.get("path") or project.get("name") or "project")
         safe_slug = "".join(
             c if c.isalnum() or c in "-_ ." else "-" for c in project_slug
@@ -125,40 +152,33 @@ def build_graph(settings: Settings):
             branch=target_branch,
             git_username=settings.gitlab_git_username,
         )
-        branch = create_issue_branch(repo_dir, state["issue_iid"], suffix=stamp)
-        if target_branch == branch:
-            raise RuntimeError(
-                "Target branch cannot be the same as the AI source branch"
-            )
+        # Transition: clone only. No agent branch is created and nothing is
+        # pushed; the agent works in the checked-out target branch workspace.
         return {
             "run_dir": str(run_dir),
             "repo_dir": str(repo_dir),
-            "branch": branch,
+            "branch": target_branch,
             "target_branch": target_branch,
             "fix_attempts": 0,
             "check_history": [],
+            "published": False,
             "status": "workspace_prepared",
         }
 
     def run_agent(state: WorkflowState) -> dict:
-        result = run_openhands(
+        result = agent_runner(
             repo_dir=Path(state["repo_dir"]),
             issue=state["issue"],
             project=state["project"],
             branch=state["branch"],
-            settings=settings,
         )
         return {"agent_result": result, "status": "implementation_completed"}
 
     def run_checks(state: WorkflowState) -> dict:
         round_number = len(state.get("check_history", [])) + 1
-        report = run_build_and_test(
+        report = verification_runner(
             repo_dir=Path(state["repo_dir"]),
             run_dir=Path(state["run_dir"]),
-            setup_command=settings.setup_command,
-            build_command=settings.build_command,
-            test_command=settings.test_command,
-            timeout_seconds=settings.check_timeout_seconds,
             round_number=round_number,
         )
         history = list(state.get("check_history", [])) + [report]
@@ -181,12 +201,11 @@ def build_graph(settings: Settings):
 
     def repair_agent(state: WorkflowState) -> dict:
         attempt = int(state.get("fix_attempts", 0)) + 1
-        result = run_openhands(
+        result = agent_runner(
             repo_dir=Path(state["repo_dir"]),
             issue=state["issue"],
             project=state["project"],
             branch=state["branch"],
-            settings=settings,
             repair_context=format_check_failures(state.get("last_check_report") or {}),
             repair_attempt=attempt,
         )
@@ -196,87 +215,28 @@ def build_graph(settings: Settings):
             "status": f"repair_attempt_{attempt}_completed",
         }
 
-    def publish_changes(state: WorkflowState) -> dict:
-        commit_sha = None
-        try:
-            commit_sha = commit_and_push_branch(
-                Path(state["repo_dir"]),
-                branch=state["branch"],
-                token=settings.gitlab_token,
-                author_name=settings.git_author_name,
-                author_email=settings.git_author_email,
-                commit_message=f"AI: implement issue #{state['issue_iid']}",
-                git_username=settings.gitlab_git_username,
-            )
-            existing = gitlab.find_open_merge_request(
-                state["project_id"], state["branch"], state["target_branch"]
-            )
-            if existing:
-                merge_request = existing
-                created = False
-            else:
-                issue = state["issue"]
-                title = (
-                    state.get("mr_title")
-                    or f"Resolve #{state['issue_iid']}: {issue.get('title', 'GitLab issue')}"
-                )
-                description = state.get("mr_description") or _mr_description(
-                    state, commit_sha
-                )
-                merge_request = gitlab.create_merge_request(
-                    state["project_id"],
-                    source_branch=state["branch"],
-                    target_branch=state["target_branch"],
-                    title=title,
-                    description=description,
-                    draft=bool(state.get("draft_mr", False)),
-                )
-                created = True
-            safe_mr = {
-                key: merge_request.get(key)
-                for key in (
-                    "id",
-                    "iid",
-                    "web_url",
-                    "source_branch",
-                    "target_branch",
-                    "title",
-                    "state",
-                )
-            }
-            safe_mr["created"] = created
-            return {
-                "commit_sha": commit_sha,
-                "merge_request": safe_mr,
-                "status": "published",
-            }
-        except (GitOperationError, GitLabAPIError, RuntimeError) as exc:
-            return {
-                "commit_sha": commit_sha,
-                "publish_error": str(exc),
-                "status": "publish_failed",
-            }
-
     def collect_diff(state: WorkflowState) -> dict:
         summary = get_working_tree_summary(Path(state["repo_dir"]))
-        if state.get("status") == "published":
-            final_status = "published"
-        elif state.get("status") == "publish_failed":
-            final_status = "publish_failed"
-        elif state.get("checks_passed"):
+        if state.get("checks_passed"):
             final_status = "checks_passed"
         elif not state.get("checks_configured"):
             final_status = "checks_not_configured"
         else:
             final_status = "checks_failed"
-        return {"working_tree_summary": summary, "status": final_status}
+        # Transition: nothing is ever published. Publication returns with the
+        # label-routing and delivery contracts in a later ticket.
+        return {
+            "working_tree_summary": summary,
+            "status": final_status,
+            "published": False,
+        }
 
     def route_after_checks(state: WorkflowState) -> str:
         if state.get("checks_passed"):
-            return "publish_changes"
+            return "collect_diff"
         if not state.get("checks_configured"):
-            # return "collect_diff"
-            return "publish_changes" # publish for test
+            # Incomplete verification must never route to publication.
+            return "collect_diff"
         if int(state.get("fix_attempts", 0)) < settings.max_fix_attempts:
             return "repair_agent"
         return "collect_diff"
@@ -288,7 +248,6 @@ def build_graph(settings: Settings):
         ("run_agent", run_agent),
         ("run_checks", run_checks),
         ("repair_agent", repair_agent),
-        ("publish_changes", publish_changes),
         ("collect_diff", collect_diff),
     ):
         builder.add_node(name, node)
@@ -302,11 +261,9 @@ def build_graph(settings: Settings):
         route_after_checks,
         {
             "repair_agent": "repair_agent",
-            "publish_changes": "publish_changes",
             "collect_diff": "collect_diff",
         },
     )
     builder.add_edge("repair_agent", "run_checks")
-    builder.add_edge("publish_changes", "collect_diff")
     builder.add_edge("collect_diff", END)
     return builder.compile()
