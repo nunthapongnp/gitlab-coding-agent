@@ -313,6 +313,12 @@ def verify_worker_connectivity(
     headers = {"X-Session-API-Key": api_key} if api_key else {}
     try:
         response = requests.get(f"{host}/health", headers=headers, timeout=timeout)
+    except (requests.exceptions.InvalidURL, requests.exceptions.MissingSchema) as exc:
+        raise PlannerSetupError(
+            f"PLANNER_AGENT_SERVER_URL is not a usable URL ({host!r}): {exc}. "
+            "Set it to the Agent Server worker's reachable address, e.g. "
+            "http://planner:8000 when launched through compose."
+        ) from exc
     except requests.RequestException as exc:
         raise PlannerSetupError(
             f"Planner worker endpoint {host} is not reachable ({type(exc).__name__}). "
@@ -321,6 +327,14 @@ def verify_worker_connectivity(
             "PLANNER_AGENT_SERVER_URL to its reachable address. Container "
             "networking must not assume host localhost."
         ) from exc
+    if response.status_code in (401, 403):
+        raise PlannerSetupError(
+            f"Planner worker endpoint {host} rejected the session API key "
+            f"(HTTP {response.status_code}). The worker requires an internal "
+            "session key: set AGENT_SERVER_API_KEY to the key the worker was "
+            "started with (OH_SESSION_API_KEYS_0). This internal worker "
+            "credential is separate from the coordinator's GitLab token."
+        )
     if response.status_code != 200:
         raise PlannerSetupError(
             f"Planner worker endpoint {host} answered /health with HTTP "
@@ -341,9 +355,6 @@ class RemoteAgentServerTransport:
     Probe-tested (tests/runtime probes); this adapter performs the verified
     SDK calls below and must stay in sync with requirements.lock.
     """
-
-    def __init__(self, settings: Settings):
-        self._settings = settings
 
     def _require_setup(self, settings: Settings) -> None:
         if not settings.planner_agent_server_url:
@@ -405,6 +416,12 @@ class RemoteAgentServerTransport:
             conversation.send_message(prompt)
             conversation.run()
         except Exception as exc:
+            # Release the worker conversation on failure too; retained
+            # evidence is unaffected (conversation ids are never reused).
+            try:
+                conversation.close()
+            except Exception:  # pragma: no cover - close failure is not fatal
+                pass
             raise PlannerRunError(
                 f"Planner conversation failed on worker "
                 f"{settings.planner_agent_server_url}: {type(exc).__name__}: {exc}. "

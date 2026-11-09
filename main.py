@@ -112,11 +112,11 @@ def main() -> int:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
 
+    from src.workspace import ConcurrentOperationError
     from src.workflow import (
         STATUS_INSPECTION_BLOCKED,
         STATUS_INSPECTION_FAILED,
         STATUS_OPERATION_LOCKED,
-        ConcurrentOperationError,
         RoutingRejection,
         WorkflowUnavailableError,
         run_routed_workflow,

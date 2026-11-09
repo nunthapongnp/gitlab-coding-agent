@@ -55,7 +55,7 @@ services:
     volumes:
       - workspace:/workspace
       - gitlab-agent-control:/control
-      - ${AGENT_ARTIFACT_DIR:-./agent-artifacts}:/artifacts
+      - ${AGENT_ARTIFACT_DIR:-${HOME:-/tmp}/.gitlab-coding-agent/artifacts}:/artifacts
     depends_on:
       planner:
         condition: service_healthy

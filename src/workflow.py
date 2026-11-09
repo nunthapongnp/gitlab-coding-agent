@@ -8,10 +8,9 @@ from langgraph.graph import END, START, StateGraph
 
 from .config import Settings
 from .gitlab_client import GitLabClient
-from .workspace import ConcurrentOperationError  # re-exported for main.py
+from .workspace import OperationContext, OperationLock, OperationWorkspaceError
 
 __all__ = [
-    "ConcurrentOperationError",
     "route_issue_request",
     "run_routed_workflow",
     "build_plan_graph",
@@ -35,7 +34,6 @@ MODE_EXECUTE = "execute"
 
 STATUS_ROUTED = "routed"
 STATUS_REJECTED = "rejected"
-STATUS_PLAN_UNAVAILABLE = "plan_unavailable"
 STATUS_EXECUTE_UNAVAILABLE = "execute_unavailable"
 STATUS_INSPECTION_COMPLETE = "inspection_complete"
 STATUS_INSPECTION_FAILED = "inspection_failed"
@@ -71,8 +69,8 @@ class WorkflowState(TypedDict, total=False):
     message: str
     # Ticket 03 Plan-inspection fields (all optional).
     operation: dict[str, Any]
-    operation_context: Any  # OperationContext object (in-memory)
-    locks: list[Any]  # released OperationLock objects
+    operation_context: OperationContext  # concrete object (no circular import)
+    locks: list[OperationLock]  # released OperationLock objects
     workspace_repo_dir: str
     evidence_path: str
     inspection_evidence: dict[str, Any]
@@ -382,20 +380,33 @@ def build_execute_graph(settings: Settings):
 # Plan-side inspection graph (ticket 03)
 # ---------------------------------------------------------------------------
 
-def _worker_working_dir(operation, repo_dir: Path, settings: Settings) -> str:
+def _worker_working_dir(operation: OperationContext, repo_dir: Path, settings: Settings) -> str:
     """Translate the coordinator clone path into the planner worker's path.
 
     The planner mounts the per-operation workspace root read-only at
     ``PLANNER_WORKSPACE_MOUNT`` (default ``/workspace`` in compose), so the
     clone lives at ``<mount>/<operation-id>/repo`` inside the worker.
+
+    Raises ``OperationWorkspaceError`` when the clone is not under the
+    configured ``WORKSPACE_ROOT``: the worker path could not be derived, and
+    silently pointing the planner at the mount root would inspect the wrong
+    directory.
     """
     mount = (settings.planner_workspace_mount or "/workspace").rstrip("/")
     root = Path(settings.workspace_root).expanduser().resolve()
     try:
         relative = Path(repo_dir).resolve().relative_to(root)
-        return f"{mount}/{relative}"
     except ValueError:
-        return mount
+        raise OperationWorkspaceError(
+            f"Inspection clone {Path(repo_dir).resolve()} is not under the "
+            f"configured WORKSPACE_ROOT ({root}), so the planner worker "
+            f"working directory cannot be derived for operation "
+            f"{operation.operation_id}. Fix WORKSPACE_ROOT / "
+            "PLANNER_WORKSPACE_MOUNT so the coordinator workspace root and "
+            "the planner's read-only mount describe the same location; "
+            "nothing was edited or published."
+        ) from None
+    return f"{mount}/{relative}"
 
 
 def build_plan_graph(
@@ -433,7 +444,6 @@ def build_plan_graph(
         record_evidence,
     )
     from .workspace import (
-        ConcurrentOperationError,
         OperationWorkspaceError,
         acquire_issue_and_branch_locks,
         create_operation_context as _default_operation_factory,

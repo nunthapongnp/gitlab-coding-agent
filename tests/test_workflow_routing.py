@@ -30,7 +30,6 @@ from src.workflow import (
     ROUTING_READ_CALLS,
     STATUS_EXECUTE_UNAVAILABLE,
     STATUS_INSPECTION_BLOCKED,
-    STATUS_PLAN_UNAVAILABLE,
     STATUS_REJECTED,
     RoutingRejection,
     WorkflowUnavailableError,

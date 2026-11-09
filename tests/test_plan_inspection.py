@@ -32,11 +32,10 @@ from src.workflow import (
     STATUS_INSPECTION_BLOCKED,
     STATUS_INSPECTION_COMPLETE,
     STATUS_INSPECTION_FAILED,
-    STATUS_OPERATION_LOCKED,
-    ConcurrentOperationError,
     build_plan_graph,
     run_routed_workflow,
 )
+from src.workspace import ConcurrentOperationError
 from tests.test_workflow_routing import (
     FakeGitLabTransport,
     FakeModeGraph,
@@ -276,8 +275,13 @@ class TestTransportInteraction:
         assert result["status"] == STATUS_INSPECTION_COMPLETE
 
         call = transport.calls[0]
-        assert "READ-ONLY" in call["prompt"]
-        assert "gitlab-token" not in call["prompt"].lower()
+        # Behavioral assertions: the prompt carries the inspected work items
+        # (issue data + baseline branch + operation identity), and never the
+        # coordinator's GitLab credentials.
+        assert "Add a greeting" in call["prompt"]  # issue title
+        assert "Print a greeting on startup." in call["prompt"]  # description
+        assert "main" in call["prompt"]  # inspected baseline branch
+        assert result["operation"]["operation_id"] in call["prompt"]
         assert "glpat-secret-do-not-leak" not in call["prompt"]
         # The worker working dir is translated to the planner mount layout.
         assert call["worker_working_dir"] == (
@@ -338,6 +342,94 @@ class TestTransportInteraction:
 
         assert result["status"] == STATUS_INSPECTION_BLOCKED
         assert "unreachable" in result["error_message"]
+
+
+class TestPlannerContributionInEvidence:
+    """The inspection evidence must show the planner's own contribution.
+
+    Checkbox 6 requires inspection evidence to be produced *through* the
+    Planner role, so the recorded evidence must differ when the planner
+    contributes versus when it fails.
+    """
+
+    def test_planner_observations_flow_into_recorded_evidence(
+        self, tmp_path, origin_repo
+    ):
+        settings = make_inspection_settings(tmp_path)
+        transport = FakePlannerTransport()
+
+        result = run_plan_inspection(origin_repo, settings, transport)
+
+        assert result["status"] == STATUS_INSPECTION_COMPLETE
+        evidence = json.loads(Path(result["evidence_path"]).read_text())
+        # The fake transport's distinctive content is what the recorded
+        # evidence carries — not just the coordinator's deterministic walk.
+        assert evidence["planner"]["summary"] == (
+            "Inspected fixture modules; no writes attempted."
+        )
+        assert evidence["planner"]["transport"] == "fake"
+        assert evidence["planner"]["conversation_id"] == (
+            result["operation"]["sdk_conversation_id"]
+        )
+
+    def test_evidence_differs_between_planner_success_and_failure(
+        self, tmp_path, origin_repo
+    ):
+        settings = make_inspection_settings(tmp_path)
+
+        ok = run_plan_inspection(
+            origin_repo, settings, FakePlannerTransport()
+        )
+        failed = run_plan_inspection(
+            origin_repo,
+            settings,
+            FakePlannerTransport(raise_error=PlannerRunError("planner died")),
+        )
+
+        ok_evidence = json.loads(Path(ok["evidence_path"]).read_text())
+        failed_evidence = json.loads(Path(failed["evidence_path"]).read_text())
+        assert ok_evidence["planner"]["status"] == "completed"
+        assert failed_evidence["planner"]["status"] == "failed"
+        assert ok_evidence["planner"] != failed_evidence["planner"]
+
+
+class TestRuntimeSetupFailuresClearly:
+    """Missing/invalid worker runtime setup fails clearly (checkbox 6)."""
+
+    def test_worker_working_dir_misconfiguration_is_actionable(
+        self, tmp_path, origin_repo
+    ):
+        from src.workspace import (
+            OperationContext,
+            OperationWorkspaceError,
+            generate_operation_id,
+        )
+
+        settings = make_inspection_settings(tmp_path)
+        # An injected operation factory rooted OUTSIDE settings.workspace_root
+        # mirrors a misconfigured deployment (e.g. compose mounts a different
+        # volume root than the coordinator writes to).
+        elsewhere = tmp_path / "elsewhere-workspaces"
+        context = OperationContext(
+            operation_id=generate_operation_id(),
+            workspace_root=elsewhere,
+            artifact_root=tmp_path / "artifacts",
+            control_root=tmp_path / "control",
+        )
+
+        def foreign_operation_factory(_settings):
+            return context
+
+        with pytest.raises(OperationWorkspaceError) as excinfo:
+            run_plan_inspection(
+                origin_repo,
+                settings,
+                FakePlannerTransport(),
+                operation_factory=foreign_operation_factory,
+            )
+
+        assert "WORKSPACE_ROOT" in str(excinfo.value)
+        assert "PLANNER_WORKSPACE_MOUNT" in str(excinfo.value)
 
 
 class TestSetupAndLockBoundaries:
@@ -468,6 +560,39 @@ class TestWorkerConnectivityOffline:
         # never an assumption of connectivity.
         assert "HTTP 404" in str(excinfo.value)
         assert "healthy Agent Server is required" in str(excinfo.value)
+
+    @pytest.fixture
+    def auth_rejecting_server(self):
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                self.send_response(401)
+                self.end_headers()
+                self.wfile.write(b"unauthorized")
+
+            def log_message(self, *args):  # silence
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        yield f"http://127.0.0.1:{server.server_port}"
+        server.shutdown()
+
+    def test_rejected_session_key_names_the_internal_credential(
+        self, auth_rejecting_server
+    ):
+        with pytest.raises(PlannerSetupError) as excinfo:
+            verify_worker_connectivity(auth_rejecting_server, api_key="wrong-key")
+        # The actionable failure names the internal worker credential, not
+        # the coordinator's GitLab token.
+        assert "AGENT_SERVER_API_KEY" in str(excinfo.value)
+        assert "HTTP 401" in str(excinfo.value)
+        assert "GITLAB_TOKEN" not in str(excinfo.value)
+
+    def test_malformed_worker_url_fails_with_actionable_setup_error(self):
+        with pytest.raises(PlannerSetupError) as excinfo:
+            verify_worker_connectivity("not-a-url")
+        assert "PLANNER_AGENT_SERVER_URL" in str(excinfo.value)
 
 
 class TestRoutedWorkflowSeamUnaffected:

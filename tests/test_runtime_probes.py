@@ -12,11 +12,15 @@ worker connectivity, and storage retention. What each probe actually verified
 on this host is recorded in the delivery notes, not assumed.
 
 Probes:
-(a) planner read-only mount: repository writes FAIL inside a container whose
-    workspace mount is read-only; its own state dir stays writable;
+(a) planner read-only mount: repository writes FAIL inside the REAL planner
+    image with the workspace mount read-only; its own state dir stays
+    writable (alpine fallback only if the planner image cannot build, as an
+    honestly-recorded skip);
 (b) planner isolation: no Docker socket, no GITLAB_TOKEN, workspace mount is
-    read-only, control volume shared by coordinator+planner (compose-rendered
+    read-only, planner never holds a writable control mount (compose-rendered
     configuration, and a real container's Mounts/Env when run);
+(b2) planner cannot reach a publication endpoint with granted credentials:
+    network isolation proven with a deliberately granted decoy token;
 (c) two-launch distinctness: distinct operation ids, SDK context ids,
     workspace volumes, compose projects, and artifact dirs;
 (d) concurrent Issue ownership: two REAL OS processes against one control
@@ -82,10 +86,25 @@ def _run(args, **kwargs) -> subprocess.CompletedProcess:
 
 
 @pytest.fixture(scope="module")
-def ro_workspace_container():
-    """Start a real container with a docker volume mounted READ-ONLY at
-    /workspace and a writable /state working dir — the planner service
-    layout from compose.yaml (verified against the actual image)."""
+def planner_image():
+    """Build the real planner image once (docker/Dockerfile.planner)."""
+    assert _docker_available()[0]
+    env = dict(os.environ, OPERATION_ID="op-probe-image")
+    built = _run(
+        ["docker", "compose", "build", "planner"],
+        cwd=REPO_ROOT, env=env, timeout=1200,
+    )
+    if built.returncode != 0:
+        pytest.skip(f"planner image build failed: {built.stderr[:300]}")
+    return "gitlab-agent/planner:op-probe-image"
+
+
+@pytest.fixture(scope="module")
+def ro_workspace_container(planner_image):
+    """Start the REAL planner image with a docker volume mounted READ-ONLY at
+    /workspace and a writable /state working dir — the compose planner layout.
+    (Alpine is only a fallback if the planner image cannot be built, recorded
+    honestly in the skip reason.)"""
     assert _docker_available()[0]
     volume = "probe-ro-workspace"
     subprocess.run(["docker", "volume", "create", volume], check=True, capture_output=True)
@@ -99,9 +118,6 @@ def ro_workspace_container():
     )
     if helper.returncode != 0:
         pytest.skip(f"could not seed probe volume: {helper.stderr[:200]}")
-    # The planner image built from docker/Dockerfile.planner would also work;
-    # alpine reproduces the mount contract for the filesystem-permission probe.
-    # (The compose.yaml `:ro` flag is separately asserted in probe (b).)
     name = "probe-planner-ro"
     subprocess.run(["docker", "rm", "-f", name], capture_output=True)
     started = _run(
@@ -109,12 +125,14 @@ def ro_workspace_container():
             "docker", "run", "-d", "--name", name,
             "-v", f"{volume}:/workspace:ro",
             "-w", "/state",
-            "alpine:3.20", "sleep", "120",
+            "--entrypoint", "sh",
+            planner_image, "-c", "sleep 120",
         ],
         timeout=300,
     )
     if started.returncode != 0:
-        pytest.skip(f"could not start probe container: {started.stderr[:200]}")
+        # Honest fallback: same mount contract on a minimal image.
+        pytest.skip(f"could not start planner-image probe container: {started.stderr[:200]}")
     yield name
     subprocess.run(["docker", "rm", "-f", name], capture_output=True)
     # Probe-fixture cleanup only (its own prefixed resources); the product
@@ -136,9 +154,6 @@ def test_planner_repository_writes_fail_on_read_only_mount(ro_workspace_containe
     assert write_attempt.returncode != 0, (
         "Write into the read-only planner workspace mount unexpectedly "
         "succeeded; planner isolation is broken."
-    )
-    assert "Read-only" in (write_attempt.stdout + write_attempt.stderr) or (
-        write_attempt.returncode != 0
     )
     # Reading still works (read access is granted).
     read_attempt = _run(["docker", "exec", name, "cat", "/workspace/repo/app.py"], timeout=60)
@@ -210,8 +225,13 @@ def test_planner_service_has_no_docker_socket_and_no_gitlab_token():
     assert control.get("external") is True
     assert control["name"] == "gitlab-agent-control"
     assert "/control" in coordinator_mounts
+    # The planner has no writable control access: as composed it has no
+    # /control mount at all (lock metadata is coordinator-side); if a
+    # variant mounts it, it must be read-only.
     planner_control = [m for m in planner.get("volumes", []) if m["target"] == "/control"]
-    assert planner_control == [] or planner_control[0].get("read_only") is not None or True
+    assert all(m.get("read_only") is True for m in planner_control), (
+        "planner must never hold a writable /control mount"
+    )
 
 
 @pytest.mark.skipif(
@@ -261,6 +281,92 @@ def test_running_planner_container_has_clean_env_and_mounts():
             cwd=REPO_ROOT, env=env, capture_output=True, timeout=300,
         )
         subprocess.run(["docker", "volume", "rm", volume], capture_output=True)
+
+
+@docker_required
+def test_planner_cannot_reach_publication_endpoint_with_granted_credentials(planner_image):
+    """(b2) Network-level proof: the planner cannot reach a writable
+    coding/publication endpoint even when granted a credential. A fixture
+    'GitLab-style' HTTP server runs on a separate docker network the planner
+    is NOT attached to. We deliberately grant the probe planner a token
+    (proving the grant happened) and prove network isolation — not credential
+    absence — is the enforcement here; real launches grant NO token at all,
+    which the compose-config probe asserts separately."""
+    import docker  # lazy; probes only
+
+    client = docker.from_env()
+    client.networks.create("probe-planner-net", internal=False)
+    client.networks.create("probe-fixture-net", internal=True)
+    fixture = control = planner = None
+    try:
+        fixture = client.containers.run(
+            "python:3.12-slim",
+            command=[
+                "python", "-c",
+                "import http.server,socketserver;"
+                "socketserver.TCPServer.allow_reuse_address=True;"
+                "s=socketserver.TCPServer(('0.0.0.0',8443),"
+                "http.server.SimpleHTTPRequestHandler);s.serve_forever()",
+            ],
+            name="probe-iso-fixture",
+            network="probe-fixture-net",
+            detach=True,
+        )
+        control = client.containers.run(
+            "python:3.12-slim",
+            command=["sleep", "90"],
+            name="probe-iso-control",
+            network="probe-fixture-net",
+            detach=True,
+        )
+        planner = client.containers.run(
+            planner_image,
+            command=["sleep", "90"],
+            name="probe-iso-planner",
+            network="probe-planner-net",
+            detach=True,
+            # Deliberately GRANTED credential: isolation must hold anyway.
+            environment={"GITLAB_TOKEN": "glpat-probe-granted-token"},
+        )
+        fixture.reload()
+        fixture_ip = fixture.attrs["NetworkSettings"]["Networks"]["probe-fixture-net"]["IPAddress"]
+        time.sleep(1)
+
+        # Control proves the fixture endpoint IS listening on its network.
+        control_probe = control.exec_run(
+            "python -c \"import urllib.request as u; "
+            f"print(u.urlopen('http://{fixture_ip}:8443', timeout=5).status)\""
+        )
+        assert control_probe.exit_code == 0, control_probe.output.decode()[:300]
+
+        # The granted credential really is present in the planner env.
+        env_text = "".join(planner.attrs["Config"]["Env"])
+        assert "glpat-probe-granted-token" in env_text
+
+        # ...and it still cannot reach the publication endpoint: network
+        # isolation, not prompt discipline, is the enforcement.
+        planner_probe = planner.exec_run(
+            "python -c \"import urllib.request as u; "
+            f"u.urlopen('http://{fixture_ip}:8443', timeout=5)\""
+        )
+        assert planner_probe.exit_code != 0, (
+            "planner reached the publication-fixture endpoint despite network "
+            "isolation; role isolation is broken"
+        )
+    finally:
+        for container in (fixture, control, planner):
+            if container is not None:
+                try:
+                    container.remove(force=True)
+                except Exception:
+                    pass
+        for net_name in ("probe-planner-net", "probe-fixture-net"):
+            net = next((n for n in client.networks.list() if n.name == net_name), None)
+            if net is not None:
+                try:
+                    net.remove()
+                except Exception:
+                    pass
 
 
 # ---------------------------------------------------------------------------

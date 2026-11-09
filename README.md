@@ -41,12 +41,17 @@ PLANNER_WORKSPACE_MOUNT=/workspace # workspace root as mounted inside the planne
 
 The dependency lock is in `requirements.lock`. Tested, verified combination:
 
-- CPython **3.14.7** (OpenHands requires **3.12+**; 3.14 is verified here)
+- Container images build on **python:3.12-slim** (OpenHands requires 3.12+);
+  the planner Agent Server image was built and its server verified running by
+  the runtime probes on Python 3.12.
+- Host import and remote-workspace construction verification was performed on
+  **CPython 3.14.7** (macOS arm64) against the installed packages below.
 - `openhands-sdk==1.60.2`, `openhands-tools==1.60.2`,
   `openhands-agent-server==1.60.2`, `openhands-workspace==1.60.2` — verified
   by import and remote-workspace construction against the installed packages
   (see `requirements.lock` header). Do not bump the OpenHands set casually.
-- `langgraph>=1.0,<2`, `requests>=2.32,<3`, `python-dotenv>=1.0,<2`, `pytest>=8,<10`
+- Application/test deps are exact-pinned to the tested environment:
+  `langgraph==1.2.20`, `requests==2.34.2`, `python-dotenv==1.2.4`, `pytest==9.2.0`
 
 The configured `OLLAMA_MODEL` is normalized **once** at config load: stacked
 provider prefixes are collapsed (`openai/ollama/x` → `ollama/x`), a bare

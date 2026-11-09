@@ -65,15 +65,6 @@ def generate_operation_id(now: datetime | None = None) -> str:
     return f"op-{stamp}-{uuid.uuid4().hex[:8]}"
 
 
-def _default_roots() -> tuple[Path, Path, Path]:
-    base = Path.home() / ".gitlab-coding-agent"
-    return (
-        base / "workspaces",
-        base / "artifacts",
-        base / "control",
-    )
-
-
 def generate_sdk_context_id() -> str:
     """Generate a fresh SDK conversation identifier for this operation.
 
