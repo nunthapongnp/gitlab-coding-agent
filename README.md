@@ -14,11 +14,12 @@ OLLAMA_MODEL=ollama/llama3.2:3b
 OLLAMA_API_KEY=sk-xxxx
 
 # Optional
-OPENHANDS_MAX_ITERATIONS=35 # OpenHands iterations per agent run
-OPENHANDS_TIMEOUT_SECONDS=1800 # LLM request timeout
+OPENHANDS_MAX_ITERATIONS=60 # OpenHands iterations per agent invocation
+OPENHANDS_TIMEOUT_SECONDS=1800 # Per-invocation timeout
 
-MAX_FIX_ATTEMPTS=3 # Retry Build/Test failed iterations
-CHECK_TIMEOUT_SECONDS=1200 # Build/Test timeout
+MAX_FIX_ATTEMPTS=3 # Additional fix attempts after an initial failure
+CHECK_TIMEOUT_SECONDS=1200 # Verification command timeout
+EXECUTION_MAX_RUNTIME_SECONDS=7200 # Whole Execute Run budget
 
 SETUP_COMMAND= # Override install command
 BUILD_COMMAND= # Override build command
