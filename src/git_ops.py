@@ -105,23 +105,19 @@ def get_working_tree_summary(repo_dir: Path) -> str:
     return "\n\n".join(parts) if parts else "No working-tree changes detected."
 
 
-def commit_and_push_branch(
+def commit_local(
     repo_dir: Path,
     *,
-    branch: str,
-    token: str | None,
     author_name: str,
     author_email: str,
     commit_message: str,
-    git_username: str = "oauth2",
-) -> str:
-    """Stage changes (excluding agent summary), create a local commit, and push."""
-    if not token:
-        raise GitOperationError(
-            "GITLAB_TOKEN is required to publish. Use a token with api and write_repository scopes."
-        )
+) -> str | None:
+    """Stage changes (excluding the agent summary) and create a local commit.
 
-    # Prevent accidentally publishing the internal agent summary, even if the
+    Local evidence only: this never pushes and never creates branches.
+    Returns the commit sha, or ``None`` when there was nothing to commit.
+    """
+    # Prevent accidentally committing the internal agent summary, even if the
     # agent happened to stage it during its work.
     summary_in_index = _git(["ls-files", "--stage", "--", ".agent-summary.md"], cwd=repo_dir).stdout.strip()
     if summary_in_index:
@@ -129,9 +125,7 @@ def commit_and_push_branch(
     _git(["add", "-A", "--", ".", ":(exclude).agent-summary.md"], cwd=repo_dir)
     staged = _git(["diff", "--cached", "--quiet"], cwd=repo_dir, check=False)
     if staged.returncode == 0:
-        raise GitOperationError(
-            "No source changes are staged; refusing to create an empty commit or merge request."
-        )
+        return None
     if staged.returncode != 1:
         raise GitOperationError(f"Could not inspect staged changes: {staged.stdout}")
 
@@ -146,8 +140,8 @@ def commit_and_push_branch(
             "GIT_COMMITTER_EMAIL": author_email,
         }
     )
-    # Ignore host/global Git hooks for this generated commit and push. A local
-    # hook could otherwise execute arbitrary repository/host commands.
+    # Ignore host/global Git hooks for this generated commit. A local hook
+    # could otherwise execute arbitrary repository/host commands.
     hooks_dir = repo_dir / ".git" / "openhands-disabled-hooks"
     hooks_dir.mkdir(parents=True, exist_ok=True)
     hooks_config = ["-c", f"core.hooksPath={hooks_dir}"]
@@ -156,7 +150,39 @@ def commit_and_push_branch(
         cwd=repo_dir,
         env=env,
     )
-    commit_sha = _git(["rev-parse", "HEAD"], cwd=repo_dir).stdout.strip()
+    return _git(["rev-parse", "HEAD"], cwd=repo_dir).stdout.strip()
+
+
+def commit_and_push_branch(
+    repo_dir: Path,
+    *,
+    branch: str,
+    token: str | None,
+    author_name: str,
+    author_email: str,
+    commit_message: str,
+    git_username: str = "oauth2",
+) -> str:
+    """Create a local commit via commit_local, then push the branch."""
+    if not token:
+        raise GitOperationError(
+            "GITLAB_TOKEN is required to publish. Use a token with api and write_repository scopes."
+        )
+
+    commit_sha = commit_local(
+        repo_dir,
+        author_name=author_name,
+        author_email=author_email,
+        commit_message=commit_message,
+    )
+    if commit_sha is None:
+        raise GitOperationError(
+            "No source changes are staged; refusing to create an empty commit or merge request."
+        )
+
+    # Ignore host/global Git hooks for this generated push, matching the commit.
+    hooks_dir = repo_dir / ".git" / "openhands-disabled-hooks"
+    hooks_config = ["-c", f"core.hooksPath={hooks_dir}"]
     _git(
         [*hooks_config, "push", "--set-upstream", "origin", branch],
         cwd=repo_dir,
