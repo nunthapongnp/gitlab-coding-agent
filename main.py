@@ -178,6 +178,11 @@ def main() -> int:
 
     # Plan/inspection infrastructure outcomes: failed, blocked, synthesis, or
     # publication failures exit 1 (nothing was published on these paths).
+    # synthesis_complete is NOT among them: it is an intermediate SUCCESS
+    # status of the synthesize_plan node that always leads into publish_plan,
+    # which overwrites ``status`` with the final outcome (plan_published /
+    # plan_needs_clarification / publication_failed) — so the final state
+    # never carries synthesis_complete, and only the failure set exits 1.
     status = result.get("status")
     if status in PLAN_FAILURE_TERMINAL_STATUSES:
         message = result.get("error_message") or status

@@ -41,6 +41,7 @@ STATUS_INSPECTION_FAILED = "inspection_failed"
 STATUS_INSPECTION_BLOCKED = "inspection_blocked"
 STATUS_OPERATION_LOCKED = "operation_locked"
 # Ticket 04: plan synthesis / publication outcomes (truthful terminals).
+STATUS_SYNTHESIS_COMPLETE = "synthesis_complete"
 STATUS_PLAN_SYNTHESIS_FAILED = "plan_synthesis_failed"
 STATUS_PUBLICATION_FAILED = "publication_failed"
 STATUS_PLAN_PUBLISHED = "plan_published"
@@ -53,7 +54,9 @@ INSPECTION_TERMINAL_STATUSES = frozenset(
 
 # Failure terminals that route the Plan graph to finalize (lock release).
 # Success terminals (plan_published / plan_needs_clarification) route through
-# request_review first; inspection_complete now continues into synthesis.
+# request_review first; inspection_complete now continues into synthesis, and
+# synthesis success carries the intermediate synthesis_complete status (a
+# success path that leads into publish_plan, never a terminal).
 PLAN_FAILURE_TERMINAL_STATUSES = frozenset(
     {
         STATUS_INSPECTION_FAILED,
@@ -576,10 +579,13 @@ def build_plan_graph(
     Truthful terminal states: ``plan_published`` (executable plan published),
     ``plan_needs_clarification`` (non-executable plan published with
     unresolved questions), ``plan_synthesis_failed`` / ``publication_failed``
-    (nothing published), and the inspection failed/blocked states. The Issue
-    lock is held from acquisition through publication; ``finalize_inspection``
-    releases it. Nothing is ever deleted or reset, and no branch/commit/push/
-    MR-creation path exists anywhere in this graph.
+    (nothing published), and the inspection failed/blocked states.
+    ``synthesis_complete`` is the intermediate SUCCESS status of the
+    synthesize_plan node (the plan content validated); it always leads into
+    publish_plan, which overwrites ``status`` with the final truthful
+    outcome. The Issue lock is held from acquisition through publication;
+    ``finalize_inspection`` releases it. Nothing is ever deleted or reset,
+    and no branch/commit/push/MR-creation path exists anywhere in this graph.
 
     Injection seams keep offline tests free of Docker/LLM/GitLab:
     - ``operation_factory(settings) -> OperationContext``
@@ -1002,8 +1008,12 @@ def build_plan_graph(
             },
         }
         synthesis_path = _record_plan_synthesis_evidence(context, synthesis_record)
+        # Truthful status: synthesis itself succeeded (the plan validated);
+        # publication has not happened yet, so this is NOT inspection_complete
+        # — publish_plan sets the final truthful outcome (plan_published /
+        # plan_needs_clarification / publication_failed).
         return {
-            "status": STATUS_INSPECTION_COMPLETE,
+            "status": STATUS_SYNTHESIS_COMPLETE,
             "issue_notes": notes,
             "plan": plan.to_dict(),
             "plan_synthesis": synthesis_record,
