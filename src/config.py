@@ -38,6 +38,7 @@ class Settings:
     timeout_seconds: int
     max_fix_attempts: int
     check_timeout_seconds: int
+    execution_max_runtime_seconds: int
     setup_command: str | None
     build_command: str | None
     test_command: str | None
@@ -55,10 +56,15 @@ class Settings:
             ollama_base_url=os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/"),
             ollama_model=os.getenv("OLLAMA_MODEL", "gemma4:e4b"),
             ollama_api_key=os.getenv("OLLAMA_API_KEY", "ollama"),
-            max_iterations=_int_env("OPENHANDS_MAX_ITERATIONS", "35", 1),
+            # Defaults per implementation plan section 10; values are never
+            # silently clamped.
+            max_iterations=_int_env("OPENHANDS_MAX_ITERATIONS", "60", 1),
             timeout_seconds=_int_env("OPENHANDS_TIMEOUT_SECONDS", "1800", 1),
             max_fix_attempts=_int_env("MAX_FIX_ATTEMPTS", "3", 0),
             check_timeout_seconds=_int_env("CHECK_TIMEOUT_SECONDS", "1200", 1),
+            execution_max_runtime_seconds=_int_env(
+                "EXECUTION_MAX_RUNTIME_SECONDS", "7200", 1
+            ),
             setup_command=(os.getenv("SETUP_COMMAND") or "").strip() or None,
             build_command=(os.getenv("BUILD_COMMAND") or "").strip() or None,
             test_command=(os.getenv("TEST_COMMAND") or "").strip() or None,

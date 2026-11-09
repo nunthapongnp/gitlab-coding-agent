@@ -7,27 +7,98 @@ from dataclasses import replace
 from pathlib import Path
 
 from src.config import Settings
-from src.gitlab_client import GitLabAPIError
-from src.git_ops import GitOperationError
+
+
+# Obsolete branch/MR-creation controls: the agent no longer creates branches
+# or merge requests, so these flags get an actionable removal error instead of
+# a generic "unrecognized arguments" one.
+OBSOLETE_MR_CREATION_FLAGS = (
+    "--target-branch",
+    "--mr-title",
+    "--mr-description",
+    "--draft-mr",
+)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="GitLab issue → LangGraph → OpenHands/Ollama coding agent"
+        description="GitLab issue → label-routed coding agent (Plan/Execute preparation)"
     )
     parser.add_argument("--project", required=True, help="GitLab project ID or namespace/project path")
     parser.add_argument("--issue", required=True, type=int, help="GitLab issue IID")
     parser.add_argument("--gitlab-url", help="GitLab instance URL; overrides GITLAB_URL")
-    parser.add_argument("--output-dir", type=Path, default=Path("runs"), help="Folder for disposable clones and run reports")
-    parser.add_argument("--target-branch", help="MR target branch; defaults to the GitLab project's default branch")
-    parser.add_argument("--mr-title", help="Override generated merge request title")
-    parser.add_argument("--mr-description", help="Override generated merge request description")
-    parser.add_argument("--draft-mr", action="store_true", help="Create the merge request as Draft")
-    parser.add_argument("--setup-command", help="Optional dependency/setup command before each validation round")
-    parser.add_argument("--build-command", help="Override auto-detected build command")
-    parser.add_argument("--test-command", help="Override auto-detected test command")
+    parser.add_argument("--output-dir", type=Path, default=Path("runs"), help="Folder for run diagnostics and reports")
+    parser.add_argument(
+        "--branch",
+        help="Plan-only: inspection baseline branch override; rejected for Execute",
+    )
+    parser.add_argument("--setup-command", help="Optional dependency/setup command hint")
+    parser.add_argument("--build-command", help="Optional build command hint")
+    parser.add_argument("--test-command", help="Optional unit test command hint")
     parser.add_argument("--max-fix-attempts", type=int, help="Maximum repair loops after initial implementation")
-    return parser.parse_args()
+    args, unknown = parser.parse_known_args()
+    for flag in OBSOLETE_MR_CREATION_FLAGS:
+        for token in unknown:
+            if token == flag or token.startswith(flag + "="):
+                parser.error(
+                    f"{flag} was removed: the agent no longer creates branches or "
+                    "merge requests and never merges. Create your own source "
+                    "branch and one merge request in the Issue project, label it "
+                    "agent::implement, and retry."
+                )
+    if unknown:
+        parser.error(f"unrecognized arguments: {' '.join(unknown)}")
+    return args
+
+
+def _load_settings(args: argparse.Namespace) -> Settings:
+    settings = Settings.from_env(output_dir=args.output_dir)
+    if args.max_fix_attempts is not None and args.max_fix_attempts < 0:
+        raise ValueError("--max-fix-attempts must be an integer >= 0")
+    if args.branch is not None and not args.branch.strip():
+        raise ValueError("--branch must be a non-empty branch name")
+    overrides = {}
+    if args.gitlab_url:
+        overrides["gitlab_url"] = args.gitlab_url.rstrip("/")
+    if args.setup_command is not None:
+        overrides["setup_command"] = args.setup_command.strip() or None
+    if args.build_command is not None:
+        overrides["build_command"] = args.build_command.strip() or None
+    if args.test_command is not None:
+        overrides["test_command"] = args.test_command.strip() or None
+    if args.max_fix_attempts is not None:
+        overrides["max_fix_attempts"] = args.max_fix_attempts
+    if overrides:
+        settings = replace(settings, **overrides)
+    return settings
+
+
+def _save_report(
+    args: argparse.Namespace,
+    settings: Settings,
+    *,
+    mode: str | None,
+    status: str | None,
+    message: str | None = None,
+    extra: dict | None = None,
+) -> Path:
+    report = {
+        "mode": mode,
+        "status": status,
+        "message": message,
+        "project": args.project,
+        "issue_iid": args.issue,
+        "branch_override": args.branch,
+        "max_fix_attempts": settings.max_fix_attempts,
+        "execution_max_runtime_seconds": settings.execution_max_runtime_seconds,
+    }
+    if extra:
+        report.update(extra)
+    report_path = args.output_dir / "poc-result.json"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    print(f"\nSaved run summary: {report_path}")
+    return report_path
 
 
 def main() -> int:
@@ -36,114 +107,60 @@ def main() -> int:
     # Application boundary: malformed environment values and invalid arguments
     # produce an actionable diagnostic and exit code 2, never a traceback.
     try:
-        settings = Settings.from_env(output_dir=args.output_dir)
-        if args.max_fix_attempts is not None and args.max_fix_attempts < 0:
-            raise ValueError("--max-fix-attempts must be an integer >= 0")
-        overrides = {}
-        if args.gitlab_url:
-            overrides["gitlab_url"] = args.gitlab_url.rstrip("/")
-        if args.setup_command is not None:
-            overrides["setup_command"] = args.setup_command.strip() or None
-        if args.build_command is not None:
-            overrides["build_command"] = args.build_command.strip() or None
-        if args.test_command is not None:
-            overrides["test_command"] = args.test_command.strip() or None
-        if args.max_fix_attempts is not None:
-            overrides["max_fix_attempts"] = args.max_fix_attempts
-        if overrides:
-            settings = replace(settings, **overrides)
+        settings = _load_settings(args)
     except ValueError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
 
-    try:
-        from src.workflow import build_graph
+    from src.workflow import (
+        RoutingRejection,
+        WorkflowUnavailableError,
+        run_routed_workflow,
+    )
 
-        graph = build_graph(settings)
-        result = graph.invoke(
-            {
-                "project_id": args.project,
-                "issue_iid": args.issue,
-                "target_branch": args.target_branch,
-                "mr_title": args.mr_title,
-                "mr_description": args.mr_description,
-                "draft_mr": args.draft_mr,
-            },
-            config={"recursion_limit": max(30, 15 + settings.max_fix_attempts * 5)},
+    # Label routing: validate the Issue state, select Plan or Execute, and
+    # dispatch. Rejected invocations and unavailable downstream behavior have
+    # distinct exit codes and structured statuses; nothing is edited or
+    # published on rejection, and no labels are written in this transition.
+    try:
+        result = run_routed_workflow(
+            settings,
+            project_id=args.project,
+            issue_iid=args.issue,
+            branch_override=args.branch,
         )
-    except (GitLabAPIError, GitOperationError, RuntimeError, ValueError, ImportError) as exc:
+    except RoutingRejection as exc:
+        print(f"REJECTED: {exc}", file=sys.stderr)
+        _save_report(args, settings, mode=exc.mode, status=exc.status, message=str(exc))
+        return 2
+    except WorkflowUnavailableError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        # Structured outcome stays visible on stdout so automation can
+        # distinguish the routing result from the failure detail.
+        print(f"Routing outcome: mode={exc.mode} status={exc.status}")
+        _save_report(args, settings, mode=exc.mode, status=exc.status, message=str(exc))
+        return 1
+    except (RuntimeError, ValueError, ImportError) as exc:
+        # GitLabAPIError/GitOperationError and other infrastructure failures.
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
+    # Fully successful workflow plus finalization (not reachable yet in this
+    # transition: the mode graphs fail clearly until later tickets).
     issue = result.get("issue", {})
-    project = result.get("project", {})
-    print("\n=== GitLab issue ===")
-    print(f"Project : {project.get('path_with_namespace', args.project)}")
+    print("\n=== Routing ===")
+    print(f"Mode    : {result.get('mode')}")
     print(f"Issue   : #{issue.get('iid', args.issue)} — {issue.get('title', '(no title)')}")
-    print(f"URL     : {issue.get('web_url', '(not provided)')}")
-    print(f"Workspace branch : {result.get('branch')}")
-    print(f"Target  : {result.get('target_branch')}")
-
-    print("\n=== Workflow result ===")
-    print(f"Status          : {result.get('status')}")
-    print(f"Repair attempts : {result.get('fix_attempts', 0)} / {settings.max_fix_attempts}")
-    print(f"Workspace       : {result.get('repo_dir')}")
-    if result.get("commit_sha"):
-        print(f"Local commit    : {result['commit_sha']} (local commit created; nothing was published)")
-    else:
-        print("Local commit    : none (no working-tree changes to commit)")
-    print(f"Publication     : {'yes' if result.get('published') else 'nothing was published (publication is disabled during this transition)'}")
-
-    print("\n=== Build / test validation ===")
-    for round_report in result.get("check_history", []):
-        print(f"Round {round_report.get('round')}: {'PASSED' if round_report.get('passed') else 'FAILED'}")
-        for check_name, check in (round_report.get("checks") or {}).items():
-            print(f"  {check_name}: {check.get('status')} | {check.get('command') or '(not configured)'}")
-            if check.get("log_file"):
-                print(f"    log: {check.get('log_file')}")
-
-    print("\n=== Git changes ===")
-    print(result.get("working_tree_summary", "(not available)"))
-
-    run_dir = Path(result.get("run_dir", args.output_dir))
-    report_path = run_dir / "poc-result.json"
-    safe_result = {
-        "status": result.get("status"),
-        "published": bool(result.get("published")),
-        "project": project.get("path_with_namespace"),
-        "issue_iid": issue.get("iid", args.issue),
-        "issue_title": issue.get("title"),
-        "issue_url": issue.get("web_url"),
-        "branch": result.get("branch"),
-        "target_branch": result.get("target_branch"),
-        "commit_sha": result.get("commit_sha") or None,
-        "repo_dir": result.get("repo_dir"),
-        "agent_result": result.get("agent_result"),
-        "working_tree_summary": result.get("working_tree_summary"),
-        "fix_attempts": result.get("fix_attempts", 0),
-        "max_fix_attempts": settings.max_fix_attempts,
-        "checks_passed": result.get("checks_passed", False),
-        "checks_configured": result.get("checks_configured", False),
-        "check_history": result.get("check_history", []),
-    }
-    report_path.parent.mkdir(parents=True, exist_ok=True)
-    report_path.write_text(json.dumps(safe_result, indent=2), encoding="utf-8")
-    print(f"\nSaved run summary: {report_path}")
-
-    if result.get("status") == "checks_passed":
-        print(
-            "\nVALIDATION PASSED: build, tests, and Git diff checks passed locally, "
-            "the work is preserved as a local commit, and the local report was saved."
-        )
-        print("Nothing was published: branch push and merge request creation are disabled during this transition.")
-        return 0
-    if result.get("status") == "checks_not_configured":
-        print("\nVALIDATION INCOMPLETE: build and/or test command was not detected/configured.")
-        print("Set BUILD_COMMAND and TEST_COMMAND or pass --build-command / --test-command.")
-    else:
-        print("\nVALIDATION FAILED: one or more checks still fail after the configured repair attempts.")
-    print("Nothing was published; do not publish or merge this branch until the validation issue is resolved.")
-    return 3
+    print(f"Status  : {result.get('status')}")
+    _save_report(
+        args,
+        settings,
+        mode=result.get("mode"),
+        status=result.get("status"),
+        message=result.get("message"),
+        extra={"issue_iid": issue.get("iid", args.issue)},
+    )
+    return 0
 
 
 if __name__ == "__main__":
