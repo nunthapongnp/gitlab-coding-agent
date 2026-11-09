@@ -1,0 +1,6 @@
+langgraph>=1.0,<2.0
+requests>=2.32,<3
+python-dotenv>=1.0,<2
+openhands-sdk>=1.0
+openhands-tools>=1.0
+pytest>=8,<10
