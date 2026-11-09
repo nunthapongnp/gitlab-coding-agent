@@ -114,11 +114,43 @@ class FakeGitLabTransport:
     roles, permissions, or approvals.
     """
 
-    def __init__(self, project: dict, issue: dict, issue_mrs: list[dict] | None = None):
+    def __init__(
+        self,
+        project: dict,
+        issue: dict,
+        issue_mrs: list[dict] | None = None,
+        notes: list[dict | str] | None = None,
+        *,
+        note_post_error: Exception | None = None,
+        lose_note_response: bool = False,
+        label_update_error: Exception | None = None,
+        notes_page_size: int | None = None,
+    ):
         self.project = copy.deepcopy(project)
         self.issue = copy.deepcopy(issue)
         self.issue_mrs = [copy.deepcopy(mr) for mr in (issue_mrs or [])]
+        self._notes: list[dict] = []
+        for note in notes or []:
+            if isinstance(note, str):
+                note = {"body": note}
+            self._notes.append(copy.deepcopy(note))
+        self._renumber_notes()
         self.calls: list[tuple[str, tuple]] = []
+        # Failure injection for publication/label-transition tests:
+        # - note_post_error: the POST fails BEFORE any append (total failure)
+        # - lose_note_response: the append succeeds, then the POST raises
+        #   (simulates a lost response; the dedup re-scan must find the note)
+        # - label_update_error: every label transition raises
+        self.note_post_error = note_post_error
+        self.lose_note_response = lose_note_response
+        self.label_update_error = label_update_error
+        # When set, get_issue_notes paginates at this page size so multi-page
+        # note reads are exercised offline.
+        self.notes_page_size = notes_page_size
+
+    def _renumber_notes(self) -> None:
+        for index, note in enumerate(self._notes, start=1):
+            note.setdefault("id", index)
 
     # --- read surface -----------------------------------------------------
     def get_project(self, project_id):
@@ -132,6 +164,44 @@ class FakeGitLabTransport:
     def get_issue_merge_requests(self, project_id, issue_iid):
         self.calls.append(("get_issue_merge_requests", (project_id, issue_iid)))
         return copy.deepcopy(self.issue_mrs)
+
+    def get_issue_notes(self, project_id, issue_iid, *, per_page=50, max_pages=100):
+        self.calls.append(("get_issue_notes", (project_id, issue_iid)))
+        page_size = self.notes_page_size or per_page
+        pages = [
+            self._notes[i : i + page_size]
+            for i in range(0, len(self._notes), page_size)
+        ]
+        return copy.deepcopy([note for page in (pages or [[]]) for note in page])
+
+    # --- write surface (publication + label transitions; ticket 04) --------
+    def add_issue_note(self, project_id, issue_iid, body):
+        self.calls.append(("add_issue_note", (project_id, issue_iid, body)))
+        if self.note_post_error is not None:
+            raise self.note_post_error
+        note = {"id": (max((n["id"] for n in self._notes), default=0) + 1), "body": body}
+        self._notes.append(note)
+        if self.lose_note_response:
+            raise RuntimeError(
+                "simulated lost response: note appended, then the POST raised"
+            )
+        return copy.deepcopy(note)
+
+    def update_issue_labels(self, project_id, issue_iid, *, add_labels=(), remove_labels=()):
+        self.calls.append(
+            (
+                "update_issue_labels",
+                (project_id, issue_iid, tuple(sorted(add_labels)), tuple(sorted(remove_labels))),
+            )
+        )
+        if self.label_update_error is not None:
+            raise self.label_update_error
+        labels = [label for label in self.issue["labels"] if label not in remove_labels]
+        for label in add_labels:
+            if label not in labels:
+                labels.append(label)
+        self.issue["labels"] = labels
+        return copy.deepcopy(self.issue)
 
     # --- forbidden surface -------------------------------------------------
     def _forbidden(self, name: str):
