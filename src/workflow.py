@@ -11,6 +11,7 @@ from .checks import format_check_failures, run_build_and_test
 from .config import Settings
 from .git_ops import (
     clone_repository,
+    commit_local,
     get_working_tree_summary,
 )
 from .gitlab_client import GitLabClient
@@ -18,7 +19,8 @@ from .openhands_runner import run_openhands
 
 # Injectable seams for the workflow. The defaults are the real implementations;
 # tests supply controlled fakes so no GitLab HTTP call or model call happens.
-GitLabTransport = Any  # duck-typed: GitLabClient's project/issue/MR methods
+# ``gitlab`` is intentionally duck-typed (a GitLabClient-like transport with
+# ``get_project``/``get_issue``) until ticket 02 defines the transport contract.
 AgentRunner = Callable[..., str]
 VerificationRunner = Callable[..., dict[str, Any]]
 Clock = Callable[[], datetime]
@@ -45,9 +47,9 @@ class WorkflowState(TypedDict, total=False):
     checks_passed: bool
     checks_configured: bool
     fix_attempts: int
+    # Sha of the local commit created from the agent's working-tree changes
+    # (when there were any). Never pushed during the transition.
     commit_sha: str
-    merge_request: dict[str, Any]
-    publish_error: str
     published: bool
     status: str
 
@@ -59,19 +61,21 @@ def _utc_now() -> datetime:
 def build_graph(
     settings: Settings,
     *,
-    gitlab: GitLabTransport | None = None,
+    gitlab: Any | None = None,
     agent_runner: AgentRunner | None = None,
     verification_runner: VerificationRunner | None = None,
     clock: Clock | None = None,
 ):
     """Compile the transition workflow graph.
 
-    ``gitlab``, ``agent_runner``, ``verification_runner``, and ``clock`` are
-    injectable seams; each defaults to the real implementation. During the
-    transition the workflow never creates branches, pushes, or opens merge
-    requests: it fetches the issue, prepares a clone-only workspace, runs the
-    agent, runs verification with a bounded repair loop, and collects the
-    local diff.
+    ``gitlab`` is a duck-typed GitLab transport exposing ``get_project`` and
+    ``get_issue`` (see ``GitLabClient``); ``agent_runner``,
+    ``verification_runner``, and ``clock`` are the other injectable seams. Each
+    defaults to the real implementation. During the transition the workflow
+    never creates branches, pushes, or opens merge requests: it fetches the
+    issue, prepares a clone-only workspace, runs the agent, runs verification
+    with a bounded repair loop, preserves the agent's changes as a local
+    commit, and collects the diff evidence.
     """
     gitlab = gitlab if gitlab is not None else GitLabClient(
         settings.gitlab_url, settings.gitlab_token
@@ -216,7 +220,21 @@ def build_graph(
         }
 
     def collect_diff(state: WorkflowState) -> dict:
-        summary = get_working_tree_summary(Path(state["repo_dir"]))
+        repo_dir = Path(state["repo_dir"])
+        # Capture the working-tree changes as diff evidence before they are
+        # committed, so the report keeps describing the agent's edits.
+        summary = get_working_tree_summary(repo_dir)
+        # Preserve the work as a local commit on the workspace branch (evidence
+        # for later tickets), but never push and never open a merge request.
+        commit_sha = commit_local(
+            repo_dir,
+            author_name=settings.git_author_name,
+            author_email=settings.git_author_email,
+            commit_message=(
+                f"agent: implement issue #{state['issue_iid']} "
+                f"(local commit; not published)"
+            ),
+        )
         if state.get("checks_passed"):
             final_status = "checks_passed"
         elif not state.get("checks_configured"):
@@ -225,11 +243,14 @@ def build_graph(
             final_status = "checks_failed"
         # Transition: nothing is ever published. Publication returns with the
         # label-routing and delivery contracts in a later ticket.
-        return {
+        update: dict[str, Any] = {
             "working_tree_summary": summary,
             "status": final_status,
             "published": False,
         }
+        if commit_sha:
+            update["commit_sha"] = commit_sha
+        return update
 
     def route_after_checks(state: WorkflowState) -> str:
         if state.get("checks_passed"):

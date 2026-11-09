@@ -8,15 +8,22 @@ from dotenv import load_dotenv
 
 
 def _int_env(name: str, default: str, minimum: int) -> int:
-    """Read an integer env var, raising an actionable error when malformed."""
+    """Read an integer env var, raising an actionable error when malformed
+    or below the required minimum. Values are never silently clamped."""
     raw = os.getenv(name, default)
     try:
-        return max(minimum, int(raw))
+        value = int(raw)
     except ValueError:
         raise ValueError(
             f"{name} must be an integer, got {raw!r}. "
             f"Fix the environment value or set it to the default {default!r}."
         ) from None
+    if value < minimum:
+        raise ValueError(
+            f"{name} must be an integer >= {minimum}, got {raw!r}. "
+            f"Fix the environment value or set it to the default {default!r}."
+        )
+    return value
 
 
 @dataclass(frozen=True)

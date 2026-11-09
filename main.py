@@ -88,6 +88,10 @@ def main() -> int:
     print(f"Status          : {result.get('status')}")
     print(f"Repair attempts : {result.get('fix_attempts', 0)} / {settings.max_fix_attempts}")
     print(f"Workspace       : {result.get('repo_dir')}")
+    if result.get("commit_sha"):
+        print(f"Local commit    : {result['commit_sha']} (local commit created; nothing was published)")
+    else:
+        print("Local commit    : none (no working-tree changes to commit)")
     print(f"Publication     : {'yes' if result.get('published') else 'nothing was published (publication is disabled during this transition)'}")
 
     print("\n=== Build / test validation ===")
@@ -112,6 +116,7 @@ def main() -> int:
         "issue_url": issue.get("web_url"),
         "branch": result.get("branch"),
         "target_branch": result.get("target_branch"),
+        "commit_sha": result.get("commit_sha") or None,
         "repo_dir": result.get("repo_dir"),
         "agent_result": result.get("agent_result"),
         "working_tree_summary": result.get("working_tree_summary"),
@@ -128,7 +133,7 @@ def main() -> int:
     if result.get("status") == "checks_passed":
         print(
             "\nVALIDATION PASSED: build, tests, and Git diff checks passed locally, "
-            "and the local report was saved."
+            "the work is preserved as a local commit, and the local report was saved."
         )
         print("Nothing was published: branch push and merge request creation are disabled during this transition.")
         return 0

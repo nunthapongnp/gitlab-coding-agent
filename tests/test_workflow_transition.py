@@ -77,14 +77,23 @@ class FakeGitLabTransport:
 
 
 class FakeAgentRunner:
-    """Recording agent runner; never imports OpenHands or talks to a model."""
+    """Recording agent runner; never imports OpenHands or talks to a model.
 
-    def __init__(self, summary: str = "Agent implemented the issue."):
+    With ``change_file`` set, each invocation writes a file into the clone so
+    the workflow has working-tree changes to preserve as a local commit.
+    """
+
+    def __init__(self, summary: str = "Agent implemented the issue.", change_file: str | None = None):
         self.summary = summary
+        self.change_file = change_file
         self.calls: list[dict] = []
 
     def __call__(self, **kwargs) -> str:
         self.calls.append(kwargs)
+        if self.change_file:
+            (Path(kwargs["repo_dir"]) / self.change_file).write_text(
+                "agent change\n", encoding="utf-8"
+            )
         return self.summary
 
     @property
@@ -106,78 +115,66 @@ class FakeVerificationRunner:
         return self.report_factory(round_number)
 
 
-def incomplete_report(round_number: int) -> dict:
-    """A report like run_build_and_test produces when build/test are unset."""
-    def check(name: str) -> dict:
-        return {
-            "name": name,
-            "command": None,
-            "status": "not_configured",
-            "exit_code": None,
-            "duration_seconds": 0.0,
-            "log_file": None,
-            "output_excerpt": f"No {name} command detected.",
+def make_check_report(round_number: int, *, configuration_complete: bool) -> dict:
+    """A check report shaped like run_build_and_test's output.
+
+    ``configuration_complete=False`` yields the report produced when build/test
+    commands are unset; ``True`` yields a fully passing report. No commands
+    actually run.
+    """
+    if configuration_complete:
+        commands: dict[str, str | None] = {"setup": None, "build": "echo build", "test": "echo test"}
+        specs = {
+            "setup": ("not_requested", None, 0.0, "No SETUP_COMMAND configured."),
+            "build": ("passed", "echo build", 0.01, ""),
+            "test": ("passed", "echo test", 0.01, ""),
+            "git_diff_check": ("passed", "git diff --check", 0.01, ""),
+            "git_cached_diff_check": ("passed", "git diff --cached --check", 0.01, ""),
+        }
+    else:
+        commands = {"setup": None, "build": None, "test": None}
+        specs = {
+            "setup": ("not_requested", None, 0.0, "No SETUP_COMMAND configured."),
+            "build": ("not_configured", None, 0.0, "No build command detected."),
+            "test": ("not_configured", None, 0.0, "No test command detected."),
+            "git_diff_check": ("not_configured", None, 0.0, "No git_diff_check command detected."),
+            "git_cached_diff_check": (
+                "not_configured",
+                None,
+                0.0,
+                "No git_cached_diff_check command detected.",
+            ),
         }
 
+    checks = {
+        name: {
+            "name": name,
+            "command": command,
+            "status": status,
+            "exit_code": 0 if status == "passed" else None,
+            "duration_seconds": duration,
+            "log_file": None,
+            "output_excerpt": excerpt,
+        }
+        for name, (status, command, duration, excerpt) in specs.items()
+    }
     return {
         "round": round_number,
-        "configuration_complete": False,
-        "commands": {"setup": None, "build": None, "test": None},
-        "checks": {
-            "setup": {
-                "name": "setup",
-                "command": None,
-                "status": "not_requested",
-                "exit_code": None,
-                "duration_seconds": 0.0,
-                "log_file": None,
-                "output_excerpt": "No SETUP_COMMAND configured.",
-            },
-            "build": check("build"),
-            "test": check("test"),
-            "git_diff_check": check("git_diff_check"),
-            "git_cached_diff_check": check("git_cached_diff_check"),
-        },
-        "passed": False,
+        "configuration_complete": configuration_complete,
+        "commands": commands,
+        "checks": checks,
+        "passed": configuration_complete,
     }
+
+
+def incomplete_report(round_number: int) -> dict:
+    """A report like run_build_and_test produces when build/test are unset."""
+    return make_check_report(round_number, configuration_complete=False)
 
 
 def passing_report(round_number: int) -> dict:
     """A fully-configured, fully-passing report (no commands actually run)."""
-    def check(name: str, command: str) -> dict:
-        return {
-            "name": name,
-            "command": command,
-            "status": "passed",
-            "exit_code": 0,
-            "duration_seconds": 0.01,
-            "log_file": None,
-            "output_excerpt": "",
-        }
-
-    return {
-        "round": round_number,
-        "configuration_complete": True,
-        "commands": {"setup": None, "build": "echo build", "test": "echo test"},
-        "checks": {
-            "setup": {
-                "name": "setup",
-                "command": None,
-                "status": "not_requested",
-                "exit_code": None,
-                "duration_seconds": 0.0,
-                "log_file": None,
-                "output_excerpt": "No SETUP_COMMAND configured.",
-            },
-            "build": check("build", "echo build"),
-            "test": check("test", "echo test"),
-            "git_diff_check": check("git_diff_check", "git diff --check"),
-            "git_cached_diff_check": check(
-                "git_cached_diff_check", "git diff --cached --check"
-            ),
-        },
-        "passed": True,
-    }
+    return make_check_report(round_number, configuration_complete=True)
 
 
 def make_settings(output_dir: Path) -> Settings:
@@ -303,15 +300,8 @@ class TestWorkflowTransition:
         self, tmp_path: Path, origin_repo: Path
     ):
         settings = make_settings(tmp_path / "runs")
-        gitlab = FakeGitLabTransport(make_project(origin_repo), make_issue())
-        agent = FakeAgentRunner()
-        verification = FakeVerificationRunner(incomplete_report)
-        graph = build_graph(
-            settings,
-            gitlab=gitlab,
-            agent_runner=agent,
-            verification_runner=verification,
-            clock=lambda: FIXED_NOW,
+        graph, gitlab, agent, verification = build_injected_graph(
+            settings, origin_repo=origin_repo
         )
 
         result = invoke_workflow(graph)
@@ -319,11 +309,12 @@ class TestWorkflowTransition:
         # Truthful terminal state: incomplete verification is not success.
         assert result["status"] == "checks_not_configured"
         assert result.get("published") is False
-        assert not result.get("merge_request")
+        assert "merge_request" not in result
+        assert "publish_error" not in result
+        # The fake agent makes no working-tree changes, so no local commit.
         assert not result.get("commit_sha")
-        assert not result.get("publish_error")
 
-        # No publication side effects on the transport.
+        # Only the issue read happens on the transport; no publication calls.
         assert gitlab.publication_calls() == []
         assert [name for name, _ in gitlab.calls] == ["get_project", "get_issue"]
 
@@ -358,15 +349,10 @@ class TestWorkflowTransition:
         self, tmp_path: Path, origin_repo: Path
     ):
         settings = make_settings(tmp_path / "runs")
-        gitlab = FakeGitLabTransport(make_project(origin_repo), make_issue())
-        agent = FakeAgentRunner()
-        verification = FakeVerificationRunner(passing_report)
-        graph = build_graph(
+        graph, gitlab, agent, verification = build_injected_graph(
             settings,
-            gitlab=gitlab,
-            agent_runner=agent,
-            verification_runner=verification,
-            clock=lambda: FIXED_NOW,
+            origin_repo=origin_repo,
+            verification=FakeVerificationRunner(passing_report),
         )
 
         result = invoke_workflow(graph)
@@ -377,6 +363,41 @@ class TestWorkflowTransition:
         assert branch_names(origin_repo) == {"main"}
         assert isinstance(result["working_tree_summary"], str)
         assert result["working_tree_summary"]
+
+    def test_local_commit_preserves_changes_without_publishing(
+        self, tmp_path: Path, origin_repo: Path
+    ):
+        settings = make_settings(tmp_path / "runs")
+        agent = FakeAgentRunner(change_file="feature.py")
+        graph, gitlab, _, verification = build_injected_graph(
+            settings,
+            origin_repo=origin_repo,
+            agent_runner=agent,
+            verification=FakeVerificationRunner(passing_report),
+        )
+
+        result = invoke_workflow(graph)
+
+        assert result["status"] == "checks_passed"
+        assert result.get("published") is False
+        commit_sha = result["commit_sha"]
+        assert commit_sha
+
+        # The local commit exists in the cloned repo's history at HEAD.
+        clone = clone_dir(settings.output_dir)
+        assert head_sha(clone) == commit_sha
+        assert head_sha(clone) != head_sha(origin_repo)
+        subject = _run_git("log", "-1", "--format=%s", cwd=clone)
+        assert "issue #7" in subject
+        assert "not published" in subject
+
+        # Nothing reached the remote: same branches, no agent refs, no sha.
+        assert branch_names(origin_repo) == {"main"}
+        tracked = _run_git("ls-remote", str(origin_repo))
+        assert commit_sha not in tracked
+        assert "refs/heads/agent/" not in tracked
+        assert gitlab.publication_calls() == []
+        assert [name for name, _ in gitlab.calls] == ["get_project", "get_issue"]
 
     def test_failed_verification_repairs_within_budget_then_stops(
         self, tmp_path: Path, origin_repo: Path
@@ -392,12 +413,11 @@ class TestWorkflowTransition:
 
         verification = FakeVerificationRunner(failing_report)
         agent = FakeAgentRunner()
-        graph = build_graph(
+        graph, gitlab, agent, verification = build_injected_graph(
             settings,
-            gitlab=FakeGitLabTransport(make_project(origin_repo), make_issue()),
+            origin_repo=origin_repo,
             agent_runner=agent,
-            verification_runner=verification,
-            clock=lambda: FIXED_NOW,
+            verification=verification,
         )
 
         result = invoke_workflow(graph)
@@ -406,12 +426,10 @@ class TestWorkflowTransition:
         assert result.get("published") is False
         assert agent.repair_invocations == 1
         assert len(verification.calls) == 2
-        assert gitlab_publication_absent(graph, result)
-
-
-def gitlab_publication_absent(graph, result: dict) -> bool:
-    """The compiled transition graph exposes no publication outcome at all."""
-    return not result.get("merge_request") and not result.get("commit_sha")
+        # No publication outcome of any kind is exposed by the result.
+        assert "merge_request" not in result
+        assert "publish_error" not in result
+        assert gitlab.publication_calls() == []
 
 
 class TestApplicationBoundary:
@@ -451,18 +469,17 @@ class TestApplicationBoundary:
         capsys: pytest.CaptureFixture,
     ):
         settings = make_settings(tmp_path / "runs")
+        transports: list[FakeGitLabTransport] = []
 
         def fake_build_graph(settings_from_main, **kwargs):
             # The real build_graph is replaced by an injected variant; main
             # must run this graph unmodified and report its outcome truthfully.
             assert settings_from_main.output_dir == settings.output_dir
-            return build_graph(
-                settings_from_main,
-                gitlab=FakeGitLabTransport(make_project(origin_repo), make_issue()),
-                agent_runner=FakeAgentRunner(),
-                verification_runner=FakeVerificationRunner(incomplete_report),
-                clock=lambda: FIXED_NOW,
+            graph, gitlab, agent, verification = build_injected_graph(
+                settings_from_main, origin_repo=origin_repo
             )
+            transports.append(gitlab)
+            return graph
 
         code, out, err = self._run_main(
             monkeypatch, capsys, self.base_argv(tmp_path), graph_factory=fake_build_graph
@@ -474,12 +491,21 @@ class TestApplicationBoundary:
         assert "BUILD_COMMAND" in out
         assert "published" in out.lower()
 
+        # Observed transport calls: only the issue read, never publication.
+        transport = transports[0]
+        assert transport.calls == [
+            ("get_project", ("group/demo",)),
+            ("get_issue", ("group/demo", 7)),
+        ]
+        assert transport.publication_calls() == []
+
         report_path = next((tmp_path / "runs").rglob("poc-result.json"))
         report = json.loads(report_path.read_text(encoding="utf-8"))
         assert report["status"] == "checks_not_configured"
         assert report["published"] is False
         assert "merge_request" not in report
-        assert "commit_sha" not in report
+        # The fake agent makes no working-tree changes, so no local commit.
+        assert report["commit_sha"] is None
 
     def test_main_exit_zero_only_for_full_local_validation(
         self,
@@ -488,14 +514,17 @@ class TestApplicationBoundary:
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture,
     ):
+        transports: list[FakeGitLabTransport] = []
+
         def fake_build_graph(settings_from_main, **kwargs):
-            return build_graph(
+            graph, gitlab, agent, verification = build_injected_graph(
                 settings_from_main,
-                gitlab=FakeGitLabTransport(make_project(origin_repo), make_issue()),
-                agent_runner=FakeAgentRunner(),
-                verification_runner=FakeVerificationRunner(passing_report),
-                clock=lambda: FIXED_NOW,
+                origin_repo=origin_repo,
+                agent_runner=FakeAgentRunner(change_file="feature.py"),
+                verification=FakeVerificationRunner(passing_report),
             )
+            transports.append(gitlab)
+            return graph
 
         code, out, err = self._run_main(
             monkeypatch, capsys, self.base_argv(tmp_path), graph_factory=fake_build_graph
@@ -505,6 +534,25 @@ class TestApplicationBoundary:
         assert "SUCCESS" not in out
         assert "VALIDATION PASSED" in out
         assert "Nothing was published" in out
+
+        # Observed transport calls: only the issue read, never publication.
+        transport = transports[0]
+        assert transport.calls == [
+            ("get_project", ("group/demo",)),
+            ("get_issue", ("group/demo", 7)),
+        ]
+        assert transport.publication_calls() == []
+
+        report_path = next((tmp_path / "runs").rglob("poc-result.json"))
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        assert report["status"] == "checks_passed"
+        assert report["published"] is False
+        # The local commit is recorded in the report, on stdout, and in the
+        # clone's history — while nothing was pushed.
+        commit_sha = report["commit_sha"]
+        assert commit_sha
+        assert commit_sha in out
+        assert head_sha(Path(report["repo_dir"])) == commit_sha
 
     def test_malformed_env_integer_gives_actionable_error(
         self,
@@ -519,6 +567,34 @@ class TestApplicationBoundary:
         assert code == 2
         assert "ERROR:" in err
         assert "OPENHANDS_MAX_ITERATIONS" in err
+        assert "Traceback" not in err
+
+    @pytest.mark.parametrize(
+        ("env_name", "env_value", "minimum_hint"),
+        [
+            ("OPENHANDS_MAX_ITERATIONS", "0", ">= 1"),
+            ("CHECK_TIMEOUT_SECONDS", "0", ">= 1"),
+            ("MAX_FIX_ATTEMPTS", "-1", ">= 0"),
+        ],
+    )
+    def test_below_minimum_env_integer_is_rejected_not_clamped(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+        env_name: str,
+        env_value: str,
+        minimum_hint: str,
+    ):
+        monkeypatch.setenv(env_name, env_value)
+
+        code, out, err = self._run_main(monkeypatch, capsys, self.base_argv(tmp_path))
+
+        assert code == 2
+        assert "ERROR:" in err
+        assert env_name in err
+        assert minimum_hint in err
+        assert f"got '{env_value}'" in err
         assert "Traceback" not in err
 
     def test_negative_max_fix_attempts_gives_actionable_error(
