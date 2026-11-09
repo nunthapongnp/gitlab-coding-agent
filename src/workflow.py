@@ -67,6 +67,12 @@ PLAN_FAILURE_TERMINAL_STATUSES = frozenset(
 # MR creation, merges, approvals, user/role lookups) must never be called.
 ROUTING_READ_CALLS = frozenset({"get_project", "get_issue", "get_issue_merge_requests"})
 
+# Terminal-handling failure types for GitLab transport calls inside the Plan
+# graph: an API failure, or a locally-rejected argument (the client raises
+# ValueError/TypeError before any HTTP round trip). Every handler maps these
+# to a truthful terminal status instead of crashing the run.
+_GITLAB_FAILURES = (GitLabAPIError, ValueError, TypeError)
+
 class WorkflowState(TypedDict, total=False):
     """State handed to the selected mode graph."""
 
@@ -667,7 +673,7 @@ def build_plan_graph(
                 remove_labels=["agent::plan"],
                 add_labels=["agent::in-progress"],
             )
-        except (GitLabAPIError, ValueError, TypeError) as exc:
+        except _GITLAB_FAILURES as exc:
             failure = {
                 **outcome,
                 "outcome": "failed",
@@ -777,7 +783,7 @@ def build_plan_graph(
             notes = _gitlab(state).get_issue_notes(
                 state["project"]["id"], state["issue_iid"]
             )
-        except (GitLabAPIError, ValueError, TypeError) as exc:
+        except _GITLAB_FAILURES as exc:
             return {
                 "status": STATUS_PLAN_SYNTHESIS_FAILED,
                 "error_message": (
@@ -949,7 +955,7 @@ def build_plan_graph(
             notes = _gitlab(state).get_issue_notes(
                 state["project"]["id"], state["issue_iid"]
             )
-        except (GitLabAPIError, ValueError, TypeError) as exc:
+        except _GITLAB_FAILURES as exc:
             return {
                 "status": STATUS_PUBLICATION_FAILED,
                 "error_message": (
@@ -966,7 +972,7 @@ def build_plan_graph(
                 created = _gitlab(state).add_issue_note(
                     state["project"]["id"], state["issue_iid"], publication["body"]
                 )
-            except (GitLabAPIError, ValueError, TypeError) as exc:
+            except _GITLAB_FAILURES as exc:
                 # Lost-response dedup: the POST may have been applied before
                 # the failure was observed. Re-scan once; reposting blind
                 # would risk a duplicate version, so an unresolvable outcome
@@ -975,7 +981,7 @@ def build_plan_graph(
                     reread = _gitlab(state).get_issue_notes(
                         state["project"]["id"], state["issue_iid"]
                     )
-                except (GitLabAPIError, ValueError, TypeError) as rescan_exc:
+                except _GITLAB_FAILURES as rescan_exc:
                     return {
                         "status": STATUS_PUBLICATION_FAILED,
                         "error_message": (
@@ -1032,7 +1038,7 @@ def build_plan_graph(
                 remove_labels=["agent::in-progress"],
                 add_labels=["agent::needs-review"],
             )
-        except (GitLabAPIError, ValueError, TypeError) as exc:
+        except _GITLAB_FAILURES as exc:
             failure = {**outcome, "outcome": "needs_review_transition_failed", "error": str(exc)}
             publication["label_outcome"] = failure["outcome"]
             return {
