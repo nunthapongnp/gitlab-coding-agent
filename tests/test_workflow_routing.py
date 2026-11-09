@@ -24,6 +24,7 @@ import pytest
 
 import src.workflow as workflow_module
 from src.config import Settings
+from src.gitlab_client import GitLabAPIError
 from src.workflow import (
     MODE_EXECUTE,
     MODE_PLAN,
@@ -139,7 +140,9 @@ class FakeGitLabTransport:
         # Failure injection for publication/label-transition tests:
         # - note_post_error: the POST fails BEFORE any append (total failure)
         # - lose_note_response: the append succeeds, then the POST raises
-        #   (simulates a lost response; the dedup re-scan must find the note)
+        #   (simulates a lost response; the dedup re-scan must find the note).
+        #   GitLabAPIError is the real client's failure type after the server
+        #   applied the POST, so the workflow's except clause sees it.
         # - label_update_error: every label transition raises
         self.note_post_error = note_post_error
         self.lose_note_response = lose_note_response
@@ -182,7 +185,7 @@ class FakeGitLabTransport:
         note = {"id": (max((n["id"] for n in self._notes), default=0) + 1), "body": body}
         self._notes.append(note)
         if self.lose_note_response:
-            raise RuntimeError(
+            raise GitLabAPIError(
                 "simulated lost response: note appended, then the POST raised"
             )
         return copy.deepcopy(note)
