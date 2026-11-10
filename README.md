@@ -151,6 +151,28 @@ Labels  : transitioned_to_needs_review
   published for review, but it must be answered and regenerated (new
   `PLAN-vN` version) before it can be approved.
 
+### Plan regeneration
+
+A re-requested Plan on an Issue that already rests at `agent::needs-review` or
+`agent::approved` is a **regeneration request**: label the Issue `agent::plan`
+together with **exactly one** of `agent::approved` / `agent::needs-review`
+(label order does not matter). Any other agent-label combination is still
+rejected with exit 2 and nothing runs.
+
+Every regeneration:
+
+- re-reads the Issue and **all** comments and publishes the next full plan
+  version (`PLAN-vN+1`) as one new append-only comment; prior plan comments
+  are never edited;
+- **invalidates the prior approval/review label** — including when the
+  regenerated content is mostly unchanged — so the run always ends with the
+  Issue at `agent::needs-review` and the plan must be approved again;
+- keeps Task IDs version-local: the new version restarts at `TASK-001`, with
+  no feedback ledger, cross-version Task matching, or prior-Run adoption.
+
+The regeneration outcome follows the same EXECUTABLE / CLARIFICATION REQUIRED
+distinction and exit codes as a fresh Plan.
+
 `poc-result.json` carries the same distinction structurally in
 `plan_publication.executable`, plus an `exit_code_semantics` map. Exit codes:
 
