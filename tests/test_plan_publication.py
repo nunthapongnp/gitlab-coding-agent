@@ -39,6 +39,7 @@ instead of falling back to an older version.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -780,6 +781,79 @@ class TestRegenerationConflictingRequirements:
         assert publication["label_outcome"] == "transitioned_to_needs_review"
 
 
+class TestRegenerationProceedsPastInvalidLatestPayload:
+    def test_schema_invalid_latest_record_does_not_block_regeneration(
+        self, tmp_path, origin_repo
+    ):
+        # The latest record HAS a determinable version (v2 in the marker
+        # attrs) but its payload is schema-invalid. Regeneration is the
+        # remedy for a broken latest plan — blocking an invalid latest
+        # record is Execute's job — so the run must still proceed: allocate
+        # the full next version, publish it as ONE new comment, and never
+        # silently fall back to the earlier valid v1 as the synthesis source.
+        settings = make_inspection_settings(tmp_path)
+        transport = FakePlannerTransport()
+        valid_v2_body = plan_note_body(
+            make_plan(
+                project_id=PROJECT_ID,
+                project_path="group/demo",
+                issue_iid=ISSUE_IID,
+                version=2,
+                plan_id="PLAN-v2",
+                publication_uid="uid-seed-v2",
+            )
+        )
+        invalid_payload = json.dumps(
+            {
+                "kind": "execution_plan",
+                "version": 2,
+                "project_id": PROJECT_ID,
+                "issue_iid": ISSUE_IID,
+                "tasks": "not-a-list",
+            }
+        )
+        invalid_v2_body = re.sub(
+            r"```json\s*.*?\s*```",
+            lambda _: "```json\n" + invalid_payload + "\n```",
+            valid_v2_body,
+            count=1,
+            flags=re.DOTALL,
+        )
+        assert invalid_v2_body != valid_v2_body
+        seeded_v1 = seeded_plan_note(version=1, publication_uid="uid-seed-v1")
+
+        result, gitlab = run_plan_workflow(
+            origin_repo,
+            settings,
+            transport,
+            labels=["agent::plan", "agent::approved"],
+            notes=[seeded_v1, {"body": invalid_v2_body}],
+        )
+
+        # The run proceeded past the invalid latest record: the full next
+        # version was allocated and published (no fallback to v1, no dedup).
+        assert result["status"] == STATUS_PLAN_PUBLISHED
+        publication = result["plan_publication"]
+        assert publication["version"] == 3
+        assert publication["plan_id"] == "PLAN-v3"
+        assert publication["deduplicated"] is False
+        posts = note_posts(gitlab)
+        assert len(posts) == 1
+        assert "PLAN-v3" in posts[0][1][2]
+        # Both prior comments are untouched, byte-identical (append-only).
+        notes_after = gitlab.get_issue_notes(PROJECT_ID, ISSUE_IID)
+        assert notes_after[0]["body"] == seeded_v1["body"]
+        assert notes_after[1]["body"] == invalid_v2_body
+        # The prior approval was still invalidated; the Issue ends at
+        # needs-review.
+        activation = result["label_outcomes"][0]
+        assert activation["invalidated_labels"] == ["agent::approved"]
+        agent_labels = [
+            label for label in gitlab.issue["labels"] if label.startswith("agent::")
+        ]
+        assert agent_labels == ["agent::needs-review"]
+
+
 class TestRegenerationBlockedByMalformedLatestPlan:
     def test_malformed_latest_record_fails_synthesis_without_fallback_or_publication(
         self, tmp_path, origin_repo
@@ -818,7 +892,8 @@ class TestRegenerationBlockedByMalformedLatestPlan:
         # The latest record is malformed: the run fails truthfully instead
         # of falling back to v1 or publishing a duplicate.
         assert result["status"] == STATUS_PLAN_SYNTHESIS_FAILED
-        assert "not fall back" in result["error_message"] or "version" in result["error_message"]
+        assert "Could not allocate the next plan version" in result["error_message"]
+        assert "refusing to allocate a possibly-colliding version" in result["error_message"]
         assert note_posts(gitlab) == []
         # Nothing was published and the Issue truthfully stays in-progress;
         # no identity lookups occurred (the fake transport would raise).

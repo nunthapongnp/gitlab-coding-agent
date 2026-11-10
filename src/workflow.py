@@ -23,12 +23,21 @@ __all__ = [
 # is never inspected for routing decisions or mutated.
 PLAN_TRIGGER = "agent::plan"
 ISSUE_APPROVED_TRIGGER = "agent::approved"
+IN_PROGRESS_STATE = "agent::in-progress"
+NEEDS_REVIEW_STATE = "agent::needs-review"
 EXECUTE_TRIGGER = "agent::implement"
 
 ISSUE_AGENT_STATES = frozenset(
-    {PLAN_TRIGGER, "agent::in-progress", "agent::needs-review", ISSUE_APPROVED_TRIGGER}
+    {
+        PLAN_TRIGGER,
+        IN_PROGRESS_STATE,
+        NEEDS_REVIEW_STATE,
+        ISSUE_APPROVED_TRIGGER,
+    }
 )
-MR_AGENT_STATES = frozenset({EXECUTE_TRIGGER, "agent::in-progress", "agent::needs-review"})
+MR_AGENT_STATES = frozenset(
+    {EXECUTE_TRIGGER, IN_PROGRESS_STATE, NEEDS_REVIEW_STATE}
+)
 
 MODE_PLAN = "plan"
 MODE_EXECUTE = "execute"
@@ -56,7 +65,7 @@ INSPECTION_TERMINAL_STATUSES = frozenset(
 # plan arrives as agent::plan on top of the prior review/approval state.
 # Exactly one such prior state alongside the trigger is a regeneration
 # request; every prior state is invalidated when the run activates the Issue.
-PRIOR_PLAN_STATES = frozenset({ISSUE_APPROVED_TRIGGER, "agent::needs-review"})
+PRIOR_PLAN_STATES = frozenset({ISSUE_APPROVED_TRIGGER, NEEDS_REVIEW_STATE})
 
 # Failure terminals that route the Plan graph to finalize (lock release).
 # Success terminals (plan_published / plan_needs_clarification) route through
@@ -177,14 +186,17 @@ def _describe_labels(labels: list[str]) -> str:
     return ", ".join(labels) if labels else "(none)"
 
 
-def _plan_regeneration_prior_state(recognized: list[str]) -> str | None:
-    """Return the invalidated prior state for a regeneration request, if any.
+def split_regeneration_state(recognized: list[str]) -> str | None:
+    """Split a recognized-label set into the regeneration prior state, if any.
 
     Ticket 05: ``agent::plan`` together with exactly ONE prior review or
     approval state (``agent::approved`` / ``agent::needs-review``) is how a
     human re-requests a Plan on an Issue that already has a published plan.
-    Any other combination (``agent::in-progress`` alongside the trigger, or
-    more than two recognized states) is not a regeneration request.
+    This one predicate is the regeneration shape for BOTH call sites that
+    read labels — routing (before the lock) and ``activate_issue`` (the
+    under-lock re-read). Any other combination (``agent::in-progress``
+    alongside the trigger, or more than two recognized states) is not a
+    regeneration request and returns ``None``.
     """
     if len(recognized) != 2 or PLAN_TRIGGER not in recognized:
         return None
@@ -207,14 +219,19 @@ def _reject_issue_state(issue_iid: int, labels: list[str]) -> RoutingRejection:
     if len(recognized) > 1:
         return RoutingRejection(
             f"Issue #{issue_iid} carries conflicting agent labels: "
-            f"{_describe_labels(sorted(recognized))}. At most one recognized Issue "
-            f"agent state is allowed ({_describe_labels(sorted(known))}). "
-            "Remove the extra agent labels on the Issue and retry; other labels "
-            "are left untouched."
+            f"{_describe_labels(sorted(recognized))}. The only accepted "
+            f"multi-label combination is {PLAN_TRIGGER} together with "
+            "exactly one prior review/approval state "
+            f"({_describe_labels(sorted(PRIOR_PLAN_STATES))}) — a Plan "
+            f"regeneration request. Any other combination of the Issue "
+            f"agent states ({_describe_labels(sorted(known))}) is rejected. "
+            "Remove the extra agent labels so the Issue carries one trigger "
+            "label (or exactly that regeneration combination) and retry; "
+            "other labels are left untouched."
         )
     if recognized:
         trigger = recognized[0]
-        if trigger == "agent::in-progress":
+        if trigger == IN_PROGRESS_STATE:
             return RoutingRejection(
                 f"Issue #{issue_iid} is labeled agent::in-progress. An in-progress "
                 "label is not a request to resume work. Wait for the current "
@@ -413,7 +430,7 @@ def route_issue_request(
     issue = gitlab.get_issue(project_id, issue_iid)
     labels = [str(label) for label in (issue.get("labels") or [])]
     recognized = _recognized_labels(labels, ISSUE_AGENT_STATES)
-    prior_state = _plan_regeneration_prior_state(recognized)
+    prior_state = split_regeneration_state(recognized)
     if len(recognized) != 1 and prior_state is None:
         raise _reject_issue_state(issue_iid, labels)
     trigger = recognized[0]
@@ -716,8 +733,8 @@ def build_plan_graph(
         project_id = state["project"]["id"]
         outcome = {
             "transition": "plan_to_in_progress",
-            "removed_labels": ["agent::plan"],
-            "added_labels": ["agent::in-progress"],
+            "removed_labels": [PLAN_TRIGGER],
+            "added_labels": [IN_PROGRESS_STATE],
         }
         # Re-read the Issue UNDER the lock (§3.2 race guard): the labels may
         # have changed between routing (read without the lock) and this
@@ -744,13 +761,9 @@ def build_plan_graph(
             }
         fresh_labels = [str(label) for label in (fresh_issue.get("labels") or [])]
         recognized = _recognized_labels(fresh_labels, ISSUE_AGENT_STATES)
-        invalidated = [label for label in recognized if label in PRIOR_PLAN_STATES]
-        valid_regeneration = (
-            PLAN_TRIGGER in recognized
-            and len(recognized) == 2
-            and len(invalidated) == 1
-        )
-        if recognized != [PLAN_TRIGGER] and not valid_regeneration:
+        prior_state = split_regeneration_state(recognized)
+        invalidated = [prior_state] if prior_state is not None else []
+        if recognized != [PLAN_TRIGGER] and prior_state is None:
             blocked = {
                 **outcome,
                 "outcome": "blocked_labels_changed",
@@ -776,13 +789,13 @@ def build_plan_graph(
                 ),
                 "label_outcomes": [blocked],
             }
-        removed_labels = ["agent::plan", *invalidated]
+        removed_labels = [PLAN_TRIGGER, *invalidated]
         try:
             _gitlab().update_issue_labels(
                 project_id,
                 issue_iid,
                 remove_labels=removed_labels,
-                add_labels=["agent::in-progress"],
+                add_labels=[IN_PROGRESS_STATE],
             )
         except _GITLAB_FAILURES as exc:
             failure = {
@@ -1217,15 +1230,15 @@ def build_plan_graph(
         publication = dict(state["plan_publication"])
         outcome = {
             "transition": "in_progress_to_needs_review",
-            "removed_labels": ["agent::in-progress"],
-            "added_labels": ["agent::needs-review"],
+            "removed_labels": [IN_PROGRESS_STATE],
+            "added_labels": [NEEDS_REVIEW_STATE],
         }
         try:
             _gitlab().update_issue_labels(
                 state["project"]["id"],
                 state["issue_iid"],
-                remove_labels=["agent::in-progress"],
-                add_labels=["agent::needs-review"],
+                remove_labels=[IN_PROGRESS_STATE],
+                add_labels=[NEEDS_REVIEW_STATE],
             )
         except _GITLAB_FAILURES as exc:
             failure = {**outcome, "outcome": "needs_review_transition_failed", "error": str(exc)}
@@ -1355,9 +1368,10 @@ def run_routed_workflow(
         "project": routing.project,
         "issue_agent_labels": routing.issue_agent_labels,
         "related_mrs": routing.open_mrs,
+        # Verification hints remain optional plumbing for the mode graphs.
         # Ticket 05: None for a fresh Plan / Execute; the invalidated prior
         # review/approval state label for a regeneration request.
-        "prior_agent_state": routing.prior_agent_state,        # Verification hints remain optional plumbing for the mode graphs.
+        "prior_agent_state": routing.prior_agent_state,
         "verification_hints": {
             "setup_command": settings.setup_command,
             "build_command": settings.build_command,
