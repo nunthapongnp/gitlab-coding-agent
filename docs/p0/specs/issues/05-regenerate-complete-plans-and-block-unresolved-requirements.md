@@ -17,3 +17,22 @@
 
 **Verification:** Demonstrate observable behavior through the existing application/workflow seam. Use offline controlled transports and temporary repositories by default; use real runtime probes where permissions, locks, cancellation, or builder behavior are the property under test.
 
+## Implementation notes
+
+- Under the Issue lock, `activate_issue` re-reads the Issue labels before the
+  `agent::plan` → `agent::in-progress` transition (§3.2 race guard). When that
+  re-read finds the valid regeneration combination — `agent::plan` together
+  with exactly one of `agent::approved` / `agent::needs-review` — the run
+  treats it as a regeneration request and proceeds. This covers a human
+  applying `agent::approved` between routing (read without the lock) and the
+  transition: routing never saw that approval, and the regeneration
+  invalidates (removes) it rather than blocking the run. Any other label
+  mutation under the lock still blocks the run truthfully
+  (`inspection_blocked`; nothing is transitioned, inspected, or published).
+- A schema-invalid latest plan record whose version is still determinable does
+  not block a regeneration: regeneration is the remedy, so the run proceeds
+  and publishes the next full version as a new comment. Blocking execution on
+  a malformed/invalid latest record (version undeterminable, or invalid at or
+  above the highest valid version) is Execute's job (ticket 06); version
+  allocation itself already refuses to reuse an undeterminable version.
+
