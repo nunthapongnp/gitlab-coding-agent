@@ -42,6 +42,13 @@ from .openhands_runner import build_llm_kwargs
 from .workspace import OperationContext
 
 PLANNER_PROMPT_PATH = Path(__file__).resolve().parent / "prompt" / "planner_prompt.md"
+PLAN_SYNTHESIS_PROMPT_PATH = (
+    Path(__file__).resolve().parent / "prompt" / "plan_synthesis_prompt.md"
+)
+
+# Distinguishing header of the plan-synthesis prompt. Transports and test
+# fakes use it to tell a synthesis call apart from a plain inspection call.
+PLAN_SYNTHESIZER_ROLE_HEADER = "You are acting as a PLAN SYNTHESIZER"
 
 # Source-code suffixes considered when collecting module/source evidence.
 SOURCE_SUFFIXES = frozenset(
@@ -148,6 +155,125 @@ def make_planner_prompt(
         description=description,
         branch=branch,
         operation_id=operation.operation_id,
+    )
+
+
+def _render_issue_comments(notes: list[dict]) -> str:
+    """Render Issue notes (all pages) as requirement text for the prompt.
+
+    System-generated notes (label/mr bookkeeping) carry no requirements and
+    are skipped; every human comment is included verbatim with author and
+    timestamp so requirements recorded beyond the first API page survive.
+    """
+    lines: list[str] = []
+    for note in notes:
+        if not isinstance(note, dict) or note.get("system"):
+            continue
+        name = note.get("author") or {}
+        author_name = (
+            name.get("name") or name.get("username") or "unknown"
+            if isinstance(name, dict)
+            else str(name)
+        )
+        created = str(note.get("created_at") or "unknown time")
+        body = str(note.get("body") or "").strip()
+        if not body:
+            continue
+        lines.append(f"[{author_name} at {created}]\n{body}")
+    return "\n\n".join(lines) if lines else "(no comments on this issue)"
+
+
+def _render_inspection_summary(inspection: dict | None) -> str:
+    """Render the deterministic inspection evidence for the prompt."""
+    inspection = inspection or {}
+    lines = [
+        f"Baseline branch: {inspection.get('baseline_branch') or '(unknown)'}",
+        f"Inspected commit: {inspection.get('inspected_commit') or '(unrecorded)'}",
+    ]
+    modules = inspection.get("modules") or []
+    if modules:
+        lines.append("Top-level modules discovered (semantic scope candidates):")
+        for module in modules:
+            counts = ", ".join(
+                f"{suffix} x{count}"
+                for suffix, count in (module.get("source_by_suffix") or {}).items()
+            )
+            detail = f" [{counts}]" if counts else ""
+            lines.append(
+                f"- {module.get('path', '?')} ({module.get('file_count', 0)} files){detail}"
+            )
+    else:
+        lines.append("No top-level modules discovered.")
+    config_files = inspection.get("config_files") or []
+    if config_files:
+        lines.append(
+            "Configuration/manifest files found: " + ", ".join(config_files)
+        )
+    hints = inspection.get("verification_hints") or {}
+    for kind in ("build", "test"):
+        hint = hints.get(kind) or {}
+        command = hint.get("command")
+        if command:
+            lines.append(
+                f"{kind.capitalize()} hint: {command} "
+                f"(origin {hint.get('origin')}, {hint.get('status')} — never run "
+                "during Plan; a hint only)"
+            )
+        else:
+            lines.append(
+                f"{kind.capitalize()} hint: none discovered — if you propose one, "
+                f"it must be origin PROPOSED, confirmation UNVERIFIED"
+            )
+    return "\n".join(lines)
+
+
+def make_plan_synthesis_prompt(
+    issue: dict,
+    project: dict,
+    branch: str,
+    operation: OperationContext,
+    *,
+    notes: list[dict] | None = None,
+    inspection: dict | None = None,
+    correction: str | None = None,
+) -> str:
+    """Build the read-only plan-synthesis prompt (ticket 04, §5.1/§7).
+
+    Embeds the issue context, ALL Issue comments (already read in full by the
+    coordinator), and the deterministic inspection evidence. The planner must
+    answer with a strict JSON object shaped per §5.1; template substitution is
+    token-based (``__NAME__``) because the JSON example contains literal
+    braces that ``str.format`` would misinterpret.
+    """
+    title = str(issue.get("title") or "Untitled issue")
+    description = str(issue.get("description") or "No description provided.")
+    labels = issue.get("labels") or []
+    labels_text = ", ".join(str(label) for label in labels) or "none"
+    issue_url = str(issue.get("web_url") or "(not provided)")
+    project_name = str(
+        project.get("path_with_namespace") or project.get("name") or "repository"
+    )
+    template = PLAN_SYNTHESIS_PROMPT_PATH.read_text(encoding="utf-8")
+    correction_block = ""
+    if correction:
+        correction_block = (
+            "\nCORRECTION REQUIRED: your previous response could not be used.\n"
+            f"Problem: {correction}\n"
+            "Respond again with ONLY the corrected JSON object in the exact\n"
+            "shape shown above (inside a ```json fence). Do not repeat the\n"
+            "invalid response and do not add prose outside the fence.\n"
+        )
+    return (
+        template.replace("__PROJECT_NAME__", project_name)
+        .replace("__ISSUE_TITLE__", title)
+        .replace("__ISSUE_URL__", issue_url)
+        .replace("__LABELS_TEXT__", labels_text)
+        .replace("__OPERATION_ID__", operation.operation_id)
+        .replace("__BRANCH__", branch)
+        .replace("__DESCRIPTION__", description)
+        .replace("__COMMENTS__", _render_issue_comments(notes or []))
+        .replace("__INSPECTION_SUMMARY__", _render_inspection_summary(inspection))
+        .replace("__CORRECTION__", correction_block)
     )
 
 

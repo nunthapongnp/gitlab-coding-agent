@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, TypedDict
@@ -7,7 +8,7 @@ from typing import Any, TypedDict
 from langgraph.graph import END, START, StateGraph
 
 from .config import Settings
-from .gitlab_client import GitLabClient
+from .gitlab_client import GitLabAPIError, GitLabClient
 from .workspace import OperationContext, OperationLock, OperationWorkspaceError
 
 __all__ = [
@@ -39,16 +40,41 @@ STATUS_INSPECTION_COMPLETE = "inspection_complete"
 STATUS_INSPECTION_FAILED = "inspection_failed"
 STATUS_INSPECTION_BLOCKED = "inspection_blocked"
 STATUS_OPERATION_LOCKED = "operation_locked"
+# Ticket 04: plan synthesis / publication outcomes (truthful terminals).
+STATUS_SYNTHESIS_COMPLETE = "synthesis_complete"
+STATUS_PLAN_SYNTHESIS_FAILED = "plan_synthesis_failed"
+STATUS_PUBLICATION_FAILED = "publication_failed"
+STATUS_PLAN_PUBLISHED = "plan_published"
+STATUS_PLAN_NEEDS_CLARIFICATION = "plan_needs_clarification"
 
 # Terminal Plan-side inspection outcomes (graph returns instead of raising).
 INSPECTION_TERMINAL_STATUSES = frozenset(
     {STATUS_INSPECTION_COMPLETE, STATUS_INSPECTION_FAILED, STATUS_INSPECTION_BLOCKED}
 )
 
+# Failure terminals that route the Plan graph to finalize (lock release).
+# Success terminals (plan_published / plan_needs_clarification) route through
+# request_review first; inspection_complete now continues into synthesis, and
+# synthesis success carries the intermediate synthesis_complete status (a
+# success path that leads into publish_plan, never a terminal).
+PLAN_FAILURE_TERMINAL_STATUSES = frozenset(
+    {
+        STATUS_INSPECTION_FAILED,
+        STATUS_INSPECTION_BLOCKED,
+        STATUS_PLAN_SYNTHESIS_FAILED,
+        STATUS_PUBLICATION_FAILED,
+    }
+)
+
 # Read-only transport surface used by routing. Anything else (label writes,
 # MR creation, merges, approvals, user/role lookups) must never be called.
 ROUTING_READ_CALLS = frozenset({"get_project", "get_issue", "get_issue_merge_requests"})
 
+# Terminal-handling failure types for GitLab transport calls inside the Plan
+# graph: an API failure, or a locally-rejected argument (the client raises
+# ValueError/TypeError before any HTTP round trip). Every handler maps these
+# to a truthful terminal status instead of crashing the run.
+_GITLAB_FAILURES = (GitLabAPIError, ValueError, TypeError)
 
 class WorkflowState(TypedDict, total=False):
     """State handed to the selected mode graph."""
@@ -75,6 +101,13 @@ class WorkflowState(TypedDict, total=False):
     evidence_path: str
     inspection_evidence: dict[str, Any]
     error_message: str
+    # Ticket 04 plan synthesis/publication fields (all optional).
+    label_outcomes: list[dict[str, Any]]
+    issue_notes: list[dict[str, Any]]
+    plan: dict[str, Any]
+    plan_synthesis: dict[str, Any]
+    plan_synthesis_path: str
+    plan_publication: dict[str, Any]
 
 
 class RoutingRejection(RuntimeError):
@@ -252,6 +285,85 @@ def _select_implement_mr(
     return mr
 
 
+def _select_plan_baseline(
+    project: dict[str, Any],
+    issue_iid: int,
+    related_mrs: list[dict[str, Any]],
+) -> str | None:
+    """Apply the agreed planning-baseline matrix (implementation plan §3.3).
+
+    Order of precedent:
+    1. explicit ``--branch`` override (handled by the caller before this runs);
+    2. no related MR → the Project default branch;
+    3. exactly one related MR (open or historical) → its target branch;
+    4. several related MRs with exactly one open → that open MR's target;
+    5. several open MRs → ambiguous, reject and require an explicit branch;
+    6. other ambiguous historical cases (several closed MRs disagreeing on
+       their target branch, or a missing target branch) → reject and require
+       an explicit branch.
+
+    Returns the selected branch or ``None`` when the Project default branch
+    is missing; raises :class:`RoutingRejection` for ambiguous MR situations.
+    """
+    open_mrs = [mr for mr in related_mrs if mr.get("state") == "opened"]
+
+    def require_branch(problem: str) -> RoutingRejection:
+        return RoutingRejection(
+            f"Issue #{issue_iid} requests a Plan, but {problem} "
+            "Pass --branch to choose the planning baseline explicitly and "
+            "retry; nothing was edited or published.",
+            mode=MODE_PLAN,
+        )
+
+    def mr_target(mr: dict[str, Any]) -> str | None:
+        target = mr.get("target_branch")
+        return str(target) if target else None
+
+    if not related_mrs:
+        # Case 2: no related MR context at all — the Project default branch.
+        default_branch = project.get("default_branch")
+        return str(default_branch) if default_branch else None
+
+    if len(related_mrs) == 1:
+        # Case 3: a single related MR (open or historical) decides the target.
+        target = mr_target(related_mrs[0])
+        if not target:
+            raise require_branch(
+                f"the single related merge request "
+                f"!{related_mrs[0].get('iid', '?')} did not report a target branch."
+            )
+        return target
+
+    if len(open_mrs) == 1:
+        # Case 4: exactly one open MR among several — its target branch wins.
+        target = mr_target(open_mrs[0])
+        if not target:
+            raise require_branch(
+                f"the single open merge request !{open_mrs[0].get('iid', '?')} "
+                "did not report a target branch."
+            )
+        return target
+
+    if len(open_mrs) > 1:
+        # Case 5: several open MRs — publication baseline is ambiguous.
+        iids = ", !".join(str(mr.get("iid", "?")) for mr in open_mrs)
+        raise require_branch(
+            f"{len(open_mrs)} open merge requests are related to it "
+            f"(!{iids}), so the planning baseline is ambiguous."
+        )
+
+    # Case 6: only historical (closed/merged) MRs remain. Their targets agree
+    # only when every MR points at the same branch; otherwise it is ambiguous.
+    targets = sorted({target for mr in related_mrs if (target := mr_target(mr))})
+    if len(targets) == 1:
+        return targets[0]
+    listed = ", ".join(targets) if targets else "(none reported)"
+    raise require_branch(
+        f"several historical merge requests are related to it with disagreeing "
+        f"target branches ({listed})."
+    )
+
+
 def route_issue_request(
     *,
     gitlab: Any,
@@ -281,9 +393,12 @@ def route_issue_request(
 
     if trigger == PLAN_TRIGGER:
         if branch_override is not None:
+            # Case 1: the explicit override wins outright; related MRs are
+            # irrelevant to the baseline and are not even read.
             baseline_branch: str | None = branch_override
         else:
-            baseline_branch = project.get("default_branch") or None
+            related_mrs = gitlab.get_issue_merge_requests(project_id, issue_iid)
+            baseline_branch = _select_plan_baseline(project, issue_iid, related_mrs)
         if not baseline_branch:
             raise RoutingRejection(
                 f"GitLab project {project.get('path_with_namespace', project_id)} "
@@ -409,37 +524,82 @@ def _worker_working_dir(operation: OperationContext, repo_dir: Path, settings: S
     return f"{mount}/{relative}"
 
 
+def _find_publication_note(notes: list[dict[str, Any]], publication_uid: str) -> dict | None:
+    """Scan read notes for an already-published plan with this publication UID.
+
+    This is the §5.1 publication-UID dedup: the same UID is never posted twice,
+    no matter whether the earlier POST's response was received or lost.
+    """
+    from . import planning
+
+    for note in notes:
+        if not isinstance(note, dict):
+            continue
+        parsed = planning.parse_plan_note(note)
+        if parsed is not None and parsed.attrs.get("publication_uid") == publication_uid:
+            return note
+    return None
+
+
+def _record_plan_synthesis_evidence(context: OperationContext, payload: dict) -> Path:
+    """Write plan-synthesis evidence to artifact storage (outside the checkout).
+
+    Mirrors ``record_evidence``: only this operation's own artifact files are
+    written; retained evidence from earlier operations is never touched.
+    """
+    plan_dir = Path(context.artifact_path) / "plan"
+    plan_dir.mkdir(parents=True, exist_ok=True)
+    synthesis_path = plan_dir / "plan-synthesis.json"
+    synthesis_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return synthesis_path
+
+
 def build_plan_graph(
     settings: Settings,
     *,
     operation_factory=None,
     planner_transport=None,
     clone_fn=None,
+    gitlab=None,
 ):
-    """Compile the read-only Plan inspection graph.
+    """Compile the read-only Plan inspection + synthesis + publication graph.
 
-    Flow: validate setup → create operation context (unique id, fresh
-    workspace/artifact references) → acquire the Issue lock on the shared
-    control volume (concurrent ownership rejects immediately) → prepare a
-    fresh inspection clone at the baseline branch → run the read-only
-    Planner through the injectable transport → record module/source/
-    configuration evidence in artifact storage (outside the checkout).
+    Flow (§7): validate setup → create operation context → acquire the Issue
+    lock → **activate_issue** (agent::plan → agent::in-progress label
+    transition) → prepare a fresh inspection clone at the baseline branch →
+    run the read-only inspection Planner through the injectable transport →
+    record inspection evidence → **synthesize_plan** (re-read ALL Issue
+    comments under the lock, allocate the next plan version, run the planner
+    again for the strict-JSON plan content, assemble + validate via
+    planning.build_plan) → **publish_plan** (one append-only comment with
+    publication-UID dedup before AND after the POST, still under the lock) →
+    **request_review** (agent::in-progress → agent::needs-review transition) →
+    finalize (lock release, retained evidence).
 
-    Plan synthesis/publication is deliberately NOT implemented here (ticket
-    04). The graph stops at ``inspection_complete`` or a clearly failed/
-    blocked state; failures retain all available evidence and release the
-    lock. Nothing is ever deleted or reset.
+    Truthful terminal states: ``plan_published`` (executable plan published),
+    ``plan_needs_clarification`` (non-executable plan published with
+    unresolved questions), ``plan_synthesis_failed`` / ``publication_failed``
+    (nothing published), and the inspection failed/blocked states.
+    ``synthesis_complete`` is the intermediate SUCCESS status of the
+    synthesize_plan node (the plan content validated); it always leads into
+    publish_plan, which overwrites ``status`` with the final truthful
+    outcome. The Issue lock is held from acquisition through publication;
+    ``finalize_inspection`` releases it. Nothing is ever deleted or reset,
+    and no branch/commit/push/MR-creation path exists anywhere in this graph.
 
     Injection seams keep offline tests free of Docker/LLM/GitLab:
     - ``operation_factory(settings) -> OperationContext``
     - ``planner_transport``: a ``PlannerTransport`` (remote adapter by default)
     - ``clone_fn``: defaults to ``git_ops.clone_repository``
+    - ``gitlab``: a GitLab transport (defaults to ``GitLabClient`` from
+      settings); used for label transitions, comment reads, and publication.
     """
     from .git_ops import GitOperationError, clone_repository
     from .planner_runner import (
         PlannerRunError,
         PlannerSetupError,
         build_inspection_evidence,
+        make_plan_synthesis_prompt,
         make_planner_prompt,
         record_evidence,
     )
@@ -453,6 +613,14 @@ def build_plan_graph(
     operation_factory = operation_factory or _default_operation_factory
     clone_fn = clone_fn or clone_repository
     transport = planner_transport
+    gitlab_transport = gitlab
+
+    def _gitlab():
+        # The GitLab transport is created lazily so graphs that never reach
+        # publication (blocked at setup) never construct one needlessly.
+        if gitlab_transport is not None:
+            return gitlab_transport
+        return GitLabClient(settings.gitlab_url, settings.gitlab_token)
 
     def validate_setup(state: WorkflowState) -> dict[str, Any]:
         if not settings.planner_agent_server_url:
@@ -493,6 +661,89 @@ def build_plan_graph(
             issue_iid=state["issue_iid"],
         )
         return {"locks": locks}
+
+    def activate_issue(state: WorkflowState) -> dict[str, Any]:
+        # Explicit label transition agent::plan → agent::in-progress (§3.2),
+        # using add/remove operations only so unrelated labels survive. The
+        # failure is truthful and terminal: no inspection, no publication.
+        issue_iid = state["issue_iid"]
+        project_id = state["project"]["id"]
+        outcome = {
+            "transition": "plan_to_in_progress",
+            "removed_labels": ["agent::plan"],
+            "added_labels": ["agent::in-progress"],
+        }
+        # Re-read the Issue UNDER the lock (§3.2 race guard): the labels may
+        # have changed between routing (read without the lock) and this
+        # transition — e.g. a human added agent::approved. Transitioning on
+        # stale labels would act on a request that no longer exists.
+        try:
+            fresh_issue = _gitlab().get_issue(project_id, issue_iid)
+        except _GITLAB_FAILURES as exc:
+            failure = {
+                **outcome,
+                "outcome": "failed",
+                "error": str(exc),
+            }
+            return {
+                "status": STATUS_INSPECTION_FAILED,
+                "error_message": (
+                    f"Could not re-read Issue #{issue_iid} under the Issue "
+                    f"lock before its label transition: {exc}. Nothing was "
+                    "transitioned, no inspection clone was prepared, and "
+                    "nothing was published; the lock is released by "
+                    "finalization."
+                ),
+                "label_outcomes": [failure],
+            }
+        fresh_labels = [str(label) for label in (fresh_issue.get("labels") or [])]
+        recognized = _recognized_labels(fresh_labels, ISSUE_AGENT_STATES)
+        if recognized != [PLAN_TRIGGER]:
+            blocked = {
+                **outcome,
+                "outcome": "blocked_labels_changed",
+                "found_labels": fresh_labels,
+            }
+            return {
+                "status": STATUS_INSPECTION_BLOCKED,
+                "error_message": (
+                    f"Issue #{issue_iid} no longer carries exactly "
+                    f"{PLAN_TRIGGER} under the Issue lock; its current "
+                    f"recognized agent labels are: "
+                    f"{_describe_labels(sorted(recognized))} (all labels: "
+                    f"{_describe_labels(fresh_labels)}). The Issue state "
+                    "changed after routing — possibly a human transitioned "
+                    "or approved it. Nothing was transitioned, no inspection "
+                    "clone was prepared, nothing was published, and no other "
+                    "labels were touched. Re-run with the Issue carrying "
+                    f"exactly {PLAN_TRIGGER} to start a fresh Plan."
+                ),
+                "label_outcomes": [blocked],
+            }
+        try:
+            _gitlab().update_issue_labels(
+                project_id,
+                issue_iid,
+                remove_labels=["agent::plan"],
+                add_labels=["agent::in-progress"],
+            )
+        except _GITLAB_FAILURES as exc:
+            failure = {
+                **outcome,
+                "outcome": "failed",
+                "error": str(exc),
+            }
+            return {
+                "status": STATUS_INSPECTION_FAILED,
+                "error_message": (
+                    f"Could not transition Issue #{issue_iid} from agent::plan "
+                    f"to agent::in-progress: {exc}. No inspection clone was "
+                    "prepared, nothing was published, and no other labels "
+                    "were touched."
+                ),
+                "label_outcomes": [failure],
+            }
+        return {"label_outcomes": [{**outcome, "outcome": "transitioned"}]}
 
     def prepare_inspection_clone(state: WorkflowState) -> dict[str, Any]:
         context = state["operation_context"]
@@ -576,22 +827,392 @@ def build_plan_graph(
             "evidence_path": str(evidence_path),
         }
 
+    def _record_synthesis_failure(
+        *,
+        status: str,
+        message: str,
+        version: int,
+        publication_uid: str,
+        attempts: list[dict[str, Any]],
+        error: str | None = None,
+    ) -> dict[str, Any]:
+        """Assemble a truthful synthesis-failure state update.
+
+        Nothing is published on any of these paths; the synthesis evidence
+        record carries the publication identity and every attempt so far.
+        ``error`` is included only when the failure carries a distinct setup
+        problem (PlannerSetupError) worth surfacing as its own key.
+        """
+        record: dict[str, Any] = {
+            "publication_uid": publication_uid,
+            "allocated_version": version,
+            "attempts": attempts,
+        }
+        if error is not None:
+            record["error"] = error
+        return {"status": status, "error_message": message, "plan_synthesis": record}
+
+    def _run_synthesis_attempt(
+        attempt: int,
+        prompt: str,
+        attempts: list[dict[str, Any]],
+        *,
+        context: OperationContext,
+        repo_dir: Path,
+        version: int,
+        publication_uid: str,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        """Run one synthesis transport call.
+
+        Returns ``(planner_result, None)`` on success, or ``(None, failure)``
+        where ``failure`` is the truthful terminal state update for a setup
+        block (PlannerSetupError) or a failed conversation (PlannerRunError).
+        """
+        try:
+            planner_result = transport.run(
+                prompt=prompt,
+                repo_dir=repo_dir,
+                worker_working_dir=_worker_working_dir(context, repo_dir, settings),
+                operation=context,
+                settings=settings,
+            )
+        except PlannerSetupError as exc:
+            return None, _record_synthesis_failure(
+                status=STATUS_INSPECTION_BLOCKED,
+                message=(
+                    f"Plan synthesis could not start: {exc} Nothing was "
+                    "published; the Issue stays agent::in-progress."
+                ),
+                version=version,
+                publication_uid=publication_uid,
+                attempts=attempts,
+                error=str(exc),
+            )
+        except PlannerRunError as exc:
+            attempts.append(
+                {"attempt": attempt, "planner": {"status": "failed", "error": str(exc)}}
+            )
+            return None, _record_synthesis_failure(
+                status=STATUS_PLAN_SYNTHESIS_FAILED,
+                message=(
+                    f"Plan synthesis conversation failed: {exc} Nothing "
+                    "was published; the Issue stays agent::in-progress."
+                ),
+                version=version,
+                publication_uid=publication_uid,
+                attempts=attempts,
+            )
+        return planner_result, None
+
+    def _assemble_synthesized_plan(
+        content: dict[str, Any],
+        *,
+        issue: dict[str, Any],
+        project: dict[str, Any],
+        inspection: dict[str, Any],
+        version: int,
+        publication_uid: str,
+    ):
+        """Deterministically assemble + validate the planner's content (§5.1)."""
+        from . import planning
+
+        return planning.build_plan(
+            issue=issue,
+            project=project,
+            inspection=inspection,
+            requirement_understanding=str(
+                content.get("requirement_understanding") or ""
+            ),
+            impact=content.get("impact"),
+            tasks=content.get("tasks"),
+            validation_hints=content.get("validation_hints"),
+            # Unresolved/conflicting requirements travel with the
+            # plan and force executable=false — never dropped (§5.1).
+            unresolved_questions=content.get("unresolved_questions"),
+            version=version,
+            publication_uid=publication_uid,
+        )
+
+    def synthesize_plan(state: WorkflowState) -> dict[str, Any]:
+        # All of this happens under the held Issue lock: notes are re-read
+        # fresh so version allocation (§5.3) sees every plan published up to
+        # now, including comments that arrived after routing.
+        context = state["operation_context"]
+        evidence = state.get("inspection_evidence") or {}
+        try:
+            notes = _gitlab().get_issue_notes(
+                state["project"]["id"], state["issue_iid"]
+            )
+        except _GITLAB_FAILURES as exc:
+            return {
+                "status": STATUS_PLAN_SYNTHESIS_FAILED,
+                "error_message": (
+                    f"Could not read the Issue comments for synthesis "
+                    f"(#{state['issue_iid']}): {exc}. Nothing was published; "
+                    "the Issue stays agent::in-progress."
+                ),
+            }
+        from . import planning
+
+        try:
+            version = planning.next_plan_version(notes)
+        except planning.PlanRecordError as exc:
+            return {
+                "status": STATUS_PLAN_SYNTHESIS_FAILED,
+                "error_message": (
+                    f"Could not allocate the next plan version from the "
+                    f"Issue comments: {exc}. Nothing was published; "
+                    "the Issue stays agent::in-progress."
+                ),
+            }
+        # The operation identity doubles as the publication UID (§5.1): one
+        # run owns exactly one publication attempt, so retries and lost
+        # responses dedup against it deterministically.
+        publication_uid = context.operation_id
+        prompt = make_plan_synthesis_prompt(
+            state["issue"],
+            state["project"],
+            state["baseline_branch"],
+            context,
+            notes=notes,
+            inspection=evidence,
+        )
+
+        attempts: list[dict[str, Any]] = []
+        correction: str | None = None
+        plan = None
+        last_result: dict[str, Any] = {}
+        for attempt in range(1, 3):  # one original try + one correction retry
+            planner_result, failure = _run_synthesis_attempt(
+                attempt,
+                prompt,
+                attempts,
+                context=context,
+                repo_dir=Path(state["workspace_repo_dir"]),
+                version=version,
+                publication_uid=publication_uid,
+            )
+            if failure is not None:
+                return failure
+            last_result = planner_result
+            try:
+                # Shared fence extractor (planning.py): uses the LAST ```json
+                # fence in the planner message — chatter may precede it — and
+                # rejects anything that is not a parseable JSON object.
+                content = planning.extract_plan_content_json(
+                    planner_result.get("summary")
+                )
+                plan = _assemble_synthesized_plan(
+                    content,
+                    issue=state["issue"],
+                    project=state["project"],
+                    inspection=evidence,
+                    version=version,
+                    publication_uid=publication_uid,
+                )
+                break
+            except (ValueError, TypeError) as exc:
+                # Malformed planner output: tolerate exactly one correction
+                # retry, then fail truthfully without publishing anything.
+                correction = str(exc)
+                attempts.append(
+                    {"attempt": attempt, "error": correction, "status": "rejected"}
+                )
+                prompt = make_plan_synthesis_prompt(
+                    state["issue"],
+                    state["project"],
+                    state["baseline_branch"],
+                    context,
+                    notes=notes,
+                    inspection=evidence,
+                    correction=correction,
+                )
+        if plan is None:
+            return _record_synthesis_failure(
+                status=STATUS_PLAN_SYNTHESIS_FAILED,
+                message=(
+                    f"Planner did not return a valid plan content object after "
+                    f"one correction retry (last problem: {correction}). No "
+                    "plan comment was published; the Issue stays "
+                    "agent::in-progress."
+                ),
+                version=version,
+                publication_uid=publication_uid,
+                attempts=attempts,
+            )
+
+        synthesis_record = {
+            "publication_uid": publication_uid,
+            "allocated_version": version,
+            "plan_id": plan.plan_id,
+            "executable": plan.executable,
+            "unresolved_questions_count": len(plan.unresolved_questions),
+            "attempts": attempts,
+            "planner": {
+                "status": last_result.get("status"),
+                "summary": str(last_result.get("summary") or ""),
+                "conversation_id": last_result.get("conversation_id"),
+                "transport": last_result.get("transport"),
+            },
+        }
+        synthesis_path = _record_plan_synthesis_evidence(context, synthesis_record)
+        # Truthful status: synthesis itself succeeded (the plan validated);
+        # publication has not happened yet, so this is NOT inspection_complete
+        # — publish_plan sets the final truthful outcome (plan_published /
+        # plan_needs_clarification / publication_failed).
+        return {
+            "status": STATUS_SYNTHESIS_COMPLETE,
+            "issue_notes": notes,
+            "plan": plan.to_dict(),
+            "plan_synthesis": synthesis_record,
+            "plan_synthesis_path": str(synthesis_path),
+        }
+
+    def publish_plan(state: WorkflowState) -> dict[str, Any]:
+        from . import planning
+
+        # Still under the Issue lock. Dedup BEFORE posting: if a note with
+        # this publication UID already exists, the publication already
+        # happened and no duplicate note/version is created (§5.1).
+        plan_dict = state["plan"]
+        publication = planning.build_publication_note(plan_dict)
+        publication_uid = publication["publication_uid"]
+        try:
+            notes = _gitlab().get_issue_notes(
+                state["project"]["id"], state["issue_iid"]
+            )
+        except _GITLAB_FAILURES as exc:
+            return {
+                "status": STATUS_PUBLICATION_FAILED,
+                "error_message": (
+                    f"Could not re-read the Issue comments before publication "
+                    f"(#{state['issue_iid']}): {exc}. Nothing was posted; the "
+                    "Issue stays agent::in-progress."
+                ),
+            }
+        existing = _find_publication_note(notes, publication_uid)
+        deduplicated = existing is not None
+        created = existing
+        if created is None:
+            try:
+                created = _gitlab().add_issue_note(
+                    state["project"]["id"], state["issue_iid"], publication["body"]
+                )
+            except _GITLAB_FAILURES as exc:
+                # Lost-response dedup: the POST may have been applied before
+                # the failure was observed. Re-scan once; reposting blind
+                # would risk a duplicate version, so an unresolvable outcome
+                # is a truthful publication failure (no repeated reposts).
+                try:
+                    reread = _gitlab().get_issue_notes(
+                        state["project"]["id"], state["issue_iid"]
+                    )
+                except _GITLAB_FAILURES as rescan_exc:
+                    return {
+                        "status": STATUS_PUBLICATION_FAILED,
+                        "error_message": (
+                            f"Plan note POST failed ({exc}) and the dedup "
+                            f"re-scan also failed ({rescan_exc}). The note may "
+                            "or may not have been posted; nothing was "
+                            "reposted. Re-run once the API recovers — the "
+                            "publication UID dedups."
+                        ),
+                    }
+                created = _find_publication_note(reread, publication_uid)
+                if created is None:
+                    return {
+                        "status": STATUS_PUBLICATION_FAILED,
+                        "error_message": (
+                            f"Plan note POST failed ({exc}) and no note with "
+                            f"publication UID {publication_uid} exists after "
+                            "re-scan, so the plan was NOT published. Nothing "
+                            "was reposted; the Issue stays agent::in-progress."
+                        ),
+                    }
+        executable = bool(plan_dict.get("executable"))
+        result_publication = {
+            "version": plan_dict["version"],
+            "plan_id": plan_dict["plan_id"],
+            "publication_uid": publication_uid,
+            "note_id": created.get("id") if isinstance(created, dict) else None,
+            "note_body": publication["body"],
+            "executable": executable,
+            "unresolved_questions_count": len(
+                plan_dict.get("unresolved_questions") or []
+            ),
+            "deduplicated": deduplicated,
+        }
+        status = STATUS_PLAN_PUBLISHED if executable else STATUS_PLAN_NEEDS_CLARIFICATION
+        return {"status": status, "plan_publication": result_publication}
+
+    def request_review(state: WorkflowState) -> dict[str, Any]:
+        # Explicit transition agent::in-progress → agent::needs-review after a
+        # successful publication (executable OR clarification-required). A
+        # label failure must NOT erase the published plan nor claim total
+        # failure: it is recorded as a distinct label_outcome and the
+        # publication outcome stands.
+        publication = dict(state["plan_publication"])
+        outcome = {
+            "transition": "in_progress_to_needs_review",
+            "removed_labels": ["agent::in-progress"],
+            "added_labels": ["agent::needs-review"],
+        }
+        try:
+            _gitlab().update_issue_labels(
+                state["project"]["id"],
+                state["issue_iid"],
+                remove_labels=["agent::in-progress"],
+                add_labels=["agent::needs-review"],
+            )
+        except _GITLAB_FAILURES as exc:
+            failure = {**outcome, "outcome": "needs_review_transition_failed", "error": str(exc)}
+            publication["label_outcome"] = failure["outcome"]
+            return {
+                "plan_publication": publication,
+                "label_outcomes": list(state.get("label_outcomes") or []) + [failure],
+            }
+        success = {**outcome, "outcome": "transitioned_to_needs_review"}
+        publication["label_outcome"] = success["outcome"]
+        return {
+            "plan_publication": publication,
+            "label_outcomes": list(state.get("label_outcomes") or []) + [success],
+        }
+
     def finalize_inspection(state: WorkflowState) -> dict[str, Any]:
         # Release locks (reverse order). Retained evidence is never deleted.
         release_locks(state.get("locks") or [])
-        return {"message": state.get("error_message") or "Inspection complete."}
+        if state.get("error_message"):
+            message = state["error_message"]
+        elif state.get("plan_publication"):
+            publication = state["plan_publication"]
+            kind = "executable" if publication.get("executable") else (
+                "NOT executable — clarification required"
+            )
+            message = (
+                f"Plan {publication.get('plan_id')} published "
+                f"(note {publication.get('note_id')}, publication UID "
+                f"{publication.get('publication_uid')}, {kind}); "
+                f"label outcome: {publication.get('label_outcome')}."
+            )
+        else:
+            message = "Inspection complete."
+        return {"message": message}
 
     builder = StateGraph(WorkflowState)
     builder.add_node("validate_setup", validate_setup)
     builder.add_node("create_operation", create_operation)
     builder.add_node("acquire_issue_lock", acquire_issue_lock)
+    builder.add_node("activate_issue", activate_issue)
     builder.add_node("prepare_inspection_clone", prepare_inspection_clone)
     builder.add_node("inspect_repository", inspect_repository)
+    builder.add_node("synthesize_plan", synthesize_plan)
+    builder.add_node("publish_plan", publish_plan)
+    builder.add_node("request_review", request_review)
     builder.add_node("finalize_inspection", finalize_inspection)
 
     def route_after(node_name: str, next_node: str):
         def router(state: WorkflowState) -> str:
-            if state.get("status") in INSPECTION_TERMINAL_STATUSES:
+            if state.get("status") in PLAN_FAILURE_TERMINAL_STATUSES:
                 return "finalize_inspection"
             return next_node
 
@@ -601,10 +1222,27 @@ def build_plan_graph(
     route_after("validate_setup", "create_operation")
     route_after("create_operation", "acquire_issue_lock")
     # Lock acquisition raises ConcurrentOperationError on conflict (it must
-    # propagate); after it, terminal routing covers clone/inspection failures.
-    route_after("acquire_issue_lock", "prepare_inspection_clone")
+    # propagate). From here through publication the Issue lock is held; every
+    # failure terminal routes to finalize_inspection, which releases it.
+    route_after("acquire_issue_lock", "activate_issue")
+    route_after("activate_issue", "prepare_inspection_clone")
     route_after("prepare_inspection_clone", "inspect_repository")
-    route_after("inspect_repository", "finalize_inspection")
+    route_after("inspect_repository", "synthesize_plan")
+    route_after("synthesize_plan", "publish_plan")
+
+    def route_after_publication(state: WorkflowState) -> str:
+        # Only a successful publication (executable or clarification-required)
+        # reaches the needs-review transition; failures go straight to finalize.
+        if state.get("plan_publication"):
+            return "request_review"
+        return "finalize_inspection"
+
+    builder.add_conditional_edges(
+        "publish_plan",
+        route_after_publication,
+        ["request_review", "finalize_inspection"],
+    )
+    builder.add_edge("request_review", "finalize_inspection")
     builder.add_edge("finalize_inspection", END)
     return builder.compile()
 
@@ -636,7 +1274,11 @@ def run_routed_workflow(
     )
 
     if routing.mode == MODE_PLAN:
-        graph = plan_graph if plan_graph is not None else build_plan_graph(settings)
+        graph = (
+            plan_graph
+            if plan_graph is not None
+            else build_plan_graph(settings, gitlab=gitlab)
+        )
     else:
         graph = execute_graph if execute_graph is not None else build_execute_graph(settings)
 

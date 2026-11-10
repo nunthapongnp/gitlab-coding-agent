@@ -24,6 +24,7 @@ import pytest
 
 import src.workflow as workflow_module
 from src.config import Settings
+from src.gitlab_client import GitLabAPIError
 from src.workflow import (
     MODE_EXECUTE,
     MODE_PLAN,
@@ -91,13 +92,14 @@ def make_mr(
     project_id: int = 101,
     target_project_id: int = 101,
     source_project_id: int | None = 101,
+    target_branch: str = "main",
 ) -> dict:
     return {
         "iid": iid,
         "state": state,
         "labels": list(labels) if labels is not None else [],
         "source_branch": source_branch,
-        "target_branch": "main",
+        "target_branch": target_branch,
         "project_id": project_id,
         "target_project_id": target_project_id,
         "source_project_id": source_project_id,
@@ -113,11 +115,45 @@ class FakeGitLabTransport:
     roles, permissions, or approvals.
     """
 
-    def __init__(self, project: dict, issue: dict, issue_mrs: list[dict] | None = None):
+    def __init__(
+        self,
+        project: dict,
+        issue: dict,
+        issue_mrs: list[dict] | None = None,
+        notes: list[dict | str] | None = None,
+        *,
+        note_post_error: Exception | None = None,
+        lose_note_response: bool = False,
+        label_update_error: Exception | None = None,
+        notes_page_size: int | None = None,
+    ):
         self.project = copy.deepcopy(project)
         self.issue = copy.deepcopy(issue)
         self.issue_mrs = [copy.deepcopy(mr) for mr in (issue_mrs or [])]
+        self._notes: list[dict] = []
+        for note in notes or []:
+            if isinstance(note, str):
+                note = {"body": note}
+            self._notes.append(copy.deepcopy(note))
+        self._renumber_notes()
         self.calls: list[tuple[str, tuple]] = []
+        # Failure injection for publication/label-transition tests:
+        # - note_post_error: the POST fails BEFORE any append (total failure)
+        # - lose_note_response: the append succeeds, then the POST raises
+        #   (simulates a lost response; the dedup re-scan must find the note).
+        #   GitLabAPIError is the real client's failure type after the server
+        #   applied the POST, so the workflow's except clause sees it.
+        # - label_update_error: every label transition raises
+        self.note_post_error = note_post_error
+        self.lose_note_response = lose_note_response
+        self.label_update_error = label_update_error
+        # When set, get_issue_notes paginates at this page size so multi-page
+        # note reads are exercised offline.
+        self.notes_page_size = notes_page_size
+
+    def _renumber_notes(self) -> None:
+        for index, note in enumerate(self._notes, start=1):
+            note.setdefault("id", index)
 
     # --- read surface -----------------------------------------------------
     def get_project(self, project_id):
@@ -131,6 +167,44 @@ class FakeGitLabTransport:
     def get_issue_merge_requests(self, project_id, issue_iid):
         self.calls.append(("get_issue_merge_requests", (project_id, issue_iid)))
         return copy.deepcopy(self.issue_mrs)
+
+    def get_issue_notes(self, project_id, issue_iid, *, per_page=50, max_pages=100):
+        self.calls.append(("get_issue_notes", (project_id, issue_iid)))
+        page_size = self.notes_page_size or per_page
+        pages = [
+            self._notes[i : i + page_size]
+            for i in range(0, len(self._notes), page_size)
+        ]
+        return copy.deepcopy([note for page in (pages or [[]]) for note in page])
+
+    # --- write surface (publication + label transitions; ticket 04) --------
+    def add_issue_note(self, project_id, issue_iid, body):
+        self.calls.append(("add_issue_note", (project_id, issue_iid, body)))
+        if self.note_post_error is not None:
+            raise self.note_post_error
+        note = {"id": (max((n["id"] for n in self._notes), default=0) + 1), "body": body}
+        self._notes.append(note)
+        if self.lose_note_response:
+            raise GitLabAPIError(
+                "simulated lost response: note appended, then the POST raised"
+            )
+        return copy.deepcopy(note)
+
+    def update_issue_labels(self, project_id, issue_iid, *, add_labels=(), remove_labels=()):
+        self.calls.append(
+            (
+                "update_issue_labels",
+                (project_id, issue_iid, tuple(sorted(add_labels)), tuple(sorted(remove_labels))),
+            )
+        )
+        if self.label_update_error is not None:
+            raise self.label_update_error
+        labels = [label for label in self.issue["labels"] if label not in remove_labels]
+        for label in add_labels:
+            if label not in labels:
+                labels.append(label)
+        self.issue["labels"] = labels
+        return copy.deepcopy(self.issue)
 
     # --- forbidden surface -------------------------------------------------
     def _forbidden(self, name: str):
@@ -201,9 +275,13 @@ class TestLabelRoutingPlan:
         assert result.mode == MODE_PLAN
         assert result.baseline_branch == "main"
         assert result.issue_agent_labels == ["agent::plan"]
-        # Only the reads needed for routing; no related-MR read is required
-        # for the default Plan baseline in this ticket.
-        assert transport.read_calls() == ["get_project", "get_issue"]
+        # Plan also reads the related-MR context for the baseline matrix
+        # (implementation plan §3.3); nothing else is read or written.
+        assert transport.read_calls() == [
+            "get_project",
+            "get_issue",
+            "get_issue_merge_requests",
+        ]
         transport.assert_only_reads()
 
     def test_branch_override_wins_for_plan_baseline(self, settings):
@@ -213,6 +291,8 @@ class TestLabelRoutingPlan:
 
         assert result.mode == MODE_PLAN
         assert result.baseline_branch == "release/1.4"
+        # The explicit override wins outright: related MRs are not even read.
+        assert transport.read_calls() == ["get_project", "get_issue"]
         transport.assert_only_reads()
 
     def test_unrelated_labels_are_preserved_and_ignored(self, settings):
@@ -232,6 +312,115 @@ class TestLabelRoutingPlan:
         result = route(transport)
         assert result.mode == MODE_PLAN
         assert result.mr is None
+
+
+class TestPlanBaselineMatrix:
+    """Baseline selection matrix for Plan (implementation plan §3.3)."""
+
+    def test_no_related_mr_uses_project_default_branch(self, settings):
+        transport = FakeGitLabTransport(
+            make_project(), make_issue(["agent::plan"]), issue_mrs=[]
+        )
+
+        result = route(transport)
+
+        assert result.mode == MODE_PLAN
+        assert result.baseline_branch == "main"
+
+    def test_single_related_mr_uses_its_target_branch(self, settings):
+        mr = make_mr(iid=9, state="merged", target_branch="develop")
+        transport = FakeGitLabTransport(
+            make_project(), make_issue(["agent::plan"]), issue_mrs=[mr]
+        )
+
+        result = route(transport)
+
+        assert result.baseline_branch == "develop"
+
+    def test_single_closed_mr_with_target_wins_over_default(self, settings):
+        mr = make_mr(iid=4, state="closed", target_branch="release/1.4")
+        transport = FakeGitLabTransport(
+            make_project(), make_issue(["agent::plan"]), issue_mrs=[mr]
+        )
+
+        result = route(transport)
+
+        assert result.baseline_branch == "release/1.4"
+
+    def test_several_mrs_with_exactly_one_open_use_open_target(self, settings):
+        merged = make_mr(iid=3, state="merged", target_branch="release/1.0")
+        open_mr = make_mr(iid=9, state="opened", target_branch="develop")
+        merged2 = make_mr(iid=5, state="merged", target_branch="release/1.2")
+        transport = FakeGitLabTransport(
+            make_project(), make_issue(["agent::plan"]), issue_mrs=[merged, open_mr, merged2]
+        )
+
+        result = route(transport)
+
+        assert result.baseline_branch == "develop"
+
+    def test_multiple_open_mrs_reject_and_name_branch_flag(self, settings):
+        mrs = [
+            make_mr(iid=9, state="opened", target_branch="develop"),
+            make_mr(iid=10, state="opened", target_branch="release/1.4"),
+        ]
+        transport = FakeGitLabTransport(
+            make_project(), make_issue(["agent::plan"]), issue_mrs=mrs
+        )
+
+        with pytest.raises(RoutingRejection) as excinfo:
+            route(transport)
+
+        message = str(excinfo.value)
+        assert "--branch" in message
+        assert "!9" in message and "!10" in message
+        assert excinfo.value.mode == MODE_PLAN
+        assert excinfo.value.status == STATUS_REJECTED
+
+    def test_several_closed_mrs_with_disagreeing_targets_reject(self, settings):
+        mrs = [
+            make_mr(iid=3, state="merged", target_branch="release/1.0"),
+            make_mr(iid=5, state="closed", target_branch="release/1.2"),
+        ]
+        transport = FakeGitLabTransport(
+            make_project(), make_issue(["agent::plan"]), issue_mrs=mrs
+        )
+
+        with pytest.raises(RoutingRejection) as excinfo:
+            route(transport)
+
+        message = str(excinfo.value)
+        assert "--branch" in message
+        assert "release/1.0" in message and "release/1.2" in message
+        assert excinfo.value.mode == MODE_PLAN
+
+    def test_several_closed_mrs_with_agreeing_target_use_it(self, settings):
+        mrs = [
+            make_mr(iid=3, state="merged", target_branch="release/1.2"),
+            make_mr(iid=5, state="closed", target_branch="release/1.2"),
+        ]
+        transport = FakeGitLabTransport(
+            make_project(), make_issue(["agent::plan"]), issue_mrs=mrs
+        )
+
+        result = route(transport)
+
+        assert result.baseline_branch == "release/1.2"
+
+    def test_single_mr_without_target_branch_rejects(self, settings):
+        mr = make_mr(iid=9, state="opened")
+        del mr["target_branch"]
+        transport = FakeGitLabTransport(
+            make_project(), make_issue(["agent::plan"]), issue_mrs=[mr]
+        )
+
+        with pytest.raises(RoutingRejection) as excinfo:
+            route(transport)
+
+        message = str(excinfo.value)
+        assert "--branch" in message
+        assert "!9" in message
+        assert excinfo.value.mode == MODE_PLAN
 
 
 class TestLabelRoutingExecute:
@@ -640,7 +829,11 @@ class TestApplicationBoundary:
         assert report["mode"] == "plan"
         assert report["status"] == "inspection_blocked"
         assert "PLANNER_AGENT_SERVER_URL" in report["message"]
-        assert used.read_calls() == ["get_project", "get_issue"]
+        assert used.read_calls() == [
+            "get_project",
+            "get_issue",
+            "get_issue_merge_requests",
+        ]
         used.assert_only_reads()
 
     def test_execute_request_reports_unavailable_downstream_with_exit_1(

@@ -23,6 +23,7 @@ from pathlib import Path
 import pytest
 
 from src.planner_runner import (
+    PLAN_SYNTHESIZER_ROLE_HEADER,
     PlannerRunError,
     PlannerSetupError,
     verify_worker_connectivity,
@@ -30,8 +31,8 @@ from src.planner_runner import (
 from src.workflow import (
     MODE_PLAN,
     STATUS_INSPECTION_BLOCKED,
-    STATUS_INSPECTION_COMPLETE,
     STATUS_INSPECTION_FAILED,
+    STATUS_PLAN_PUBLISHED,
     build_plan_graph,
     run_routed_workflow,
 )
@@ -145,10 +146,24 @@ class FakePlannerTransport:
     Records every call (prompt, worker working dir, operation context) and
     returns a deterministic planner result. Fails on demand to exercise the
     failure-retention paths.
+
+    The same transport seam serves BOTH graph phases (ticket 04): a plain
+    inspection prompt gets the inspection summary; a prompt carrying the
+    PLAN SYNTHESIZER role header gets a strict-JSON plan-content object in
+    ``summary`` (the synthesis contract: the final message ends with a
+    ```json fence).
     """
 
-    def __init__(self, *, raise_error: Exception | None = None):
+    def __init__(
+        self,
+        *,
+        raise_error: Exception | None = None,
+        plan_content: dict | None = None,
+        synthesis_summary: str | None = None,
+    ):
         self.raise_error = raise_error
+        self.plan_content = plan_content
+        self.synthesis_summary = synthesis_summary
         self.calls: list[dict] = []
 
     def run(self, *, prompt, repo_dir, worker_working_dir, operation, settings):
@@ -163,6 +178,17 @@ class FakePlannerTransport:
         )
         if self.raise_error is not None:
             raise self.raise_error
+        if PLAN_SYNTHESIZER_ROLE_HEADER in prompt:
+            summary = self.synthesis_summary or json.dumps(
+                make_plan_content(), sort_keys=True
+            )
+            return {
+                "status": "completed",
+                "summary": summary,
+                "conversation_id": operation.sdk_conversation_id,
+                "worker": {"healthy": True, "endpoint": "http://planner.invalid:8000"},
+                "transport": "fake",
+            }
         return {
             "status": "completed",
             "summary": "Inspected fixture modules; no writes attempted.",
@@ -172,15 +198,62 @@ class FakePlannerTransport:
         }
 
 
+def make_plan_content() -> dict:
+    """A small valid plan-content object (§5.1 shape) for synthesis fakes."""
+    return {
+        "requirement_understanding": "Print a greeting on startup.",
+        "impact": [
+            {"module": "src", "required": True, "reason": "greeting output lives here"}
+        ],
+        "tasks": [
+            {
+                "title": "Add the greeting routine",
+                "scope": "Adds greeting printing on startup; nothing else changes.",
+                "modules": ["src"],
+                "dependencies": [],
+                "acceptance": ["Starting the app prints a greeting"],
+                "verification": ["Reviewer runs the app entry point"],
+                "configuration_changes": [],
+                "database_file_changes": [],
+            },
+            {
+                "title": "Document the greeting behavior",
+                "scope": "Updates the guide text only.",
+                "modules": ["docs"],
+                "dependencies": ["TASK-001"],
+                "acceptance": ["Guide mentions the greeting"],
+                "verification": [],
+                "configuration_changes": [],
+                "database_file_changes": [],
+            },
+        ],
+        "validation_hints": [
+            {
+                "module": "src",
+                "kind": "TEST",
+                "command": "python -m pytest",
+                "cwd": ".",
+                "origin": "PROPOSED",
+                "confirmation": "UNVERIFIED",
+            }
+        ],
+        "unresolved_questions": [],
+    }
+
+
 def run_plan_inspection(origin: Path, settings, transport: FakePlannerTransport, **kwargs):
-    graph = build_plan_graph(settings, planner_transport=transport, **kwargs)
+    # One fake GitLab transport is shared by routing AND the plan graph, so
+    # label transitions, comment reads, and publication all land in the same
+    # recorded state.
+    gitlab = FakeGitLabTransport(
+        make_project_with_origin(origin), make_issue(["agent::plan"])
+    )
+    graph = build_plan_graph(settings, planner_transport=transport, gitlab=gitlab, **kwargs)
     return run_routed_workflow(
         settings,
         project_id="group/demo",
         issue_iid=7,
-        gitlab=FakeGitLabTransport(
-            make_project_with_origin(origin), make_issue(["agent::plan"])
-        ),
+        gitlab=gitlab,
         plan_graph=graph,
     )
 
@@ -197,7 +270,10 @@ class TestDefaultBaselineInspection:
 
         result = run_plan_inspection(origin_repo, settings, transport)
 
-        assert result["status"] == STATUS_INSPECTION_COMPLETE
+        # The graph now extends past inspection: a complete plan is
+        # synthesized and published, so the truthful final state is
+        # plan_published. Inspection evidence assertions are unchanged.
+        assert result["status"] == STATUS_PLAN_PUBLISHED
         assert result["mode"] == MODE_PLAN
         operation = result["operation"]
         # Evidence recorded OUTSIDE the product checkout, under the
@@ -225,19 +301,20 @@ class TestDefaultBaselineInspection:
     def test_explicit_branch_baseline_is_used_as_clone_ref(self, tmp_path, origin_repo):
         settings = make_inspection_settings(tmp_path)
         transport = FakePlannerTransport()
+        gitlab = FakeGitLabTransport(
+            make_project_with_origin(origin_repo), make_issue(["agent::plan"])
+        )
 
         result = run_routed_workflow(
             settings,
             project_id="group/demo",
             issue_iid=7,
             branch_override="release/1.4",
-            gitlab=FakeGitLabTransport(
-                make_project_with_origin(origin_repo), make_issue(["agent::plan"])
-            ),
-            plan_graph=build_plan_graph(settings, planner_transport=transport),
+            gitlab=gitlab,
+            plan_graph=build_plan_graph(settings, planner_transport=transport, gitlab=gitlab),
         )
 
-        assert result["status"] == STATUS_INSPECTION_COMPLETE
+        assert result["status"] == STATUS_PLAN_PUBLISHED
         repo_dir = Path(result["workspace_repo_dir"])
         branch = subprocess.run(
             ["git", "rev-parse", "--abbrev-ref", "HEAD"],
@@ -272,7 +349,7 @@ class TestTransportInteraction:
         transport = FakePlannerTransport()
 
         result = run_plan_inspection(origin_repo, settings, transport)
-        assert result["status"] == STATUS_INSPECTION_COMPLETE
+        assert result["status"] == STATUS_PLAN_PUBLISHED
 
         call = transport.calls[0]
         # Behavioral assertions: the prompt carries the inspected work items
@@ -297,7 +374,7 @@ class TestTransportInteraction:
         first = run_plan_inspection(origin_repo, settings, transport)
         second = run_plan_inspection(origin_repo, settings, transport)
 
-        assert first["status"] == second["status"] == STATUS_INSPECTION_COMPLETE
+        assert first["status"] == second["status"] == STATUS_PLAN_PUBLISHED
         first_op, second_op = first["operation"], second["operation"]
         assert first_op["operation_id"] != second_op["operation_id"]
         assert (
@@ -305,8 +382,10 @@ class TestTransportInteraction:
         )
         assert first_op["artifact_path"] != second_op["artifact_path"]
         assert first_op["workspace_path"] != second_op["workspace_path"]
-        # Each transport call ran against its own fresh clone path.
-        assert transport.calls[0]["repo_dir"] != transport.calls[1]["repo_dir"]
+        # Each transport call ran against its own fresh clone path. Two calls
+        # happen per operation (inspection + synthesis), so the first call of
+        # the second operation is index 2.
+        assert transport.calls[0]["repo_dir"] != transport.calls[2]["repo_dir"]
         # Both evidence files exist independently.
         for op in (first_op, second_op):
             assert (Path(op["artifact_path"]) / "inspection" / "inspection-evidence.json").is_file()
@@ -360,7 +439,7 @@ class TestPlannerContributionInEvidence:
 
         result = run_plan_inspection(origin_repo, settings, transport)
 
-        assert result["status"] == STATUS_INSPECTION_COMPLETE
+        assert result["status"] == STATUS_PLAN_PUBLISHED
         evidence = json.loads(Path(result["evidence_path"]).read_text())
         # The fake transport's distinctive content is what the recorded
         # evidence carries — not just the coordinator's deterministic walk.
