@@ -4,7 +4,7 @@
 
 **Blocked by:** 04: Publish the first complete Execution Plan.
 
-**Status:** draft (pending breakdown review)
+**Status:** done — implemented on feature/p0-ticket-05 (a9c4177..HEAD; PR #5 to develop)
 
 - [ ] Read the current Issue and all comments again and publish a full incremented version; do not edit old plan comments.
 - [ ] Invalidate prior approval for every regeneration, including mostly unchanged content, and finish with Issue needs-review.
