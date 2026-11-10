@@ -27,6 +27,13 @@ Malformed planner output (one correction retry, then truthful failure with
 nothing published) and the application-boundary report/exit-code semantics
 (executable vs clarification-required both exit 0, synthesis/publication
 failures exit 1) close out the WP-C surface.
+
+Ticket 05 adds the regeneration surface: an agent::plan re-request on top of
+one prior review/approval state runs as a regeneration — full new version,
+append-only, prior approval invalidated, Issue always ends at needs-review —
+plus conflicting-requirements regeneration (executable=false with explicit
+unresolved questions) and a malformed latest plan record blocking synthesis
+instead of falling back to an older version.
 """
 
 from __future__ import annotations
@@ -615,7 +622,14 @@ class TestPlanRegeneration:
     ):
         settings = make_inspection_settings(tmp_path)
         transport = FakePlannerTransport()
-        seeded = seeded_plan_note(version=1, publication_uid="uid-seed-v1")
+        # Seed v1 with the same requirement the synthesizer will return, so
+        # the regenerated v2 is (mostly) unchanged content on purpose: the
+        # approval must still be invalidated.
+        seeded = seeded_plan_note(
+            version=1,
+            publication_uid="uid-seed-v1",
+            requirement_understanding="Print a greeting on startup.",
+        )
         notes = [
             seeded,
             {
@@ -642,9 +656,19 @@ class TestPlanRegeneration:
         posts = note_posts(gitlab)
         assert len(posts) == 1
         assert "PLAN-v2" in posts[0][1][2]
+        # Task IDs are version-local: the new version restarts at TASK-001.
+        assert "TASK-001" in posts[0][1][2]
         # The old plan comment is untouched, byte-identical.
         notes_after = gitlab.get_issue_notes(PROJECT_ID, ISSUE_IID)
         assert notes_after[0]["body"] == seeded["body"]
+        # The regenerated content is (mostly) UNCHANGED from the seeded v1 —
+        # approval is still invalidated for every regeneration, unchanged or
+        # not (label-outcome assertion below).
+        seeded_payload = parse_plan_note(seeded).payload
+        assert (
+            result["plan"]["requirement_understanding"]
+            == seeded_payload["requirement_understanding"]
+        )
         # The prior state label was invalidated in the activation transition
         # and the run finished at agent::needs-review — no stale approval.
         activation = result["label_outcomes"][0]

@@ -401,6 +401,13 @@ def route_issue_request(
     Approval depends only on current label values: no user, role, permission,
     timestamp, or signed-approval lookup happens anywhere. Unrecognized labels
     are never removed or mutated, and no label writes happen here.
+
+    Ticket 05: ``agent::plan`` together with exactly one prior review or
+    approval state (``agent::needs-review`` / ``agent::approved``) is a
+    regeneration request and takes the Plan flow; the prior state is recorded
+    on the result so the run can invalidate it. Any other multi-label
+    combination (and a lone ``agent::needs-review`` / ``agent::in-progress``)
+    is rejected before anything runs.
     """
     project = gitlab.get_project(project_id)
     issue = gitlab.get_issue(project_id, issue_iid)
