@@ -594,6 +594,217 @@ class TestLabelFailureAfterPublication:
 
 
 # ---------------------------------------------------------------------------
+# Ticket 05 — regeneration: new full version, invalidated approval, blocks
+# ---------------------------------------------------------------------------
+
+
+class TestPlanRegeneration:
+    """Ticket 05 acceptance: re-requested Plan on an Issue with a prior plan.
+
+    A regeneration run reads ALL comments again, allocates the next full
+    version as one new append-only comment (old plan notes are never edited),
+    invalidates the prior approval/review state label, and always ends with
+    the Issue at agent::needs-review — including when the content is mostly
+    unchanged. Approval stays label-values only: the fake transport's
+    user/role/approval methods raise AssertionError if ever called.
+    """
+
+    @pytest.mark.parametrize("prior_label", ["agent::approved", "agent::needs-review"])
+    def test_regeneration_publishes_full_new_version_and_ends_needs_review(
+        self, tmp_path, origin_repo, prior_label
+    ):
+        settings = make_inspection_settings(tmp_path)
+        transport = FakePlannerTransport()
+        seeded = seeded_plan_note(version=1, publication_uid="uid-seed-v1")
+        notes = [
+            seeded,
+            {
+                "body": "Clarification from the developer: localize the greeting.",
+                "author": {"name": "Ada"},
+                "created_at": "2026-11-02T09:00:00Z",
+            },
+        ]
+
+        result, gitlab = run_plan_workflow(
+            origin_repo,
+            settings,
+            transport,
+            labels=["agent::plan", prior_label],
+            notes=notes,
+        )
+
+        # A full NEW version was published as exactly ONE new comment.
+        assert result["status"] == STATUS_PLAN_PUBLISHED
+        publication = result["plan_publication"]
+        assert publication["version"] == 2
+        assert publication["plan_id"] == "PLAN-v2"
+        assert publication["publication_uid"] != "uid-seed-v1"
+        posts = note_posts(gitlab)
+        assert len(posts) == 1
+        assert "PLAN-v2" in posts[0][1][2]
+        # The old plan comment is untouched, byte-identical.
+        notes_after = gitlab.get_issue_notes(PROJECT_ID, ISSUE_IID)
+        assert notes_after[0]["body"] == seeded["body"]
+        # The prior state label was invalidated in the activation transition
+        # and the run finished at agent::needs-review — no stale approval.
+        activation = result["label_outcomes"][0]
+        assert activation["transition"] == "plan_to_in_progress"
+        assert sorted(activation["removed_labels"]) == sorted(
+            ["agent::plan", prior_label]
+        )
+        assert activation["invalidated_labels"] == [prior_label]
+        agent_labels = [
+            label for label in gitlab.issue["labels"] if label.startswith("agent::")
+        ]
+        assert agent_labels == ["agent::needs-review"]
+
+    def test_regeneration_from_approved_removes_approval_label_without_identity_checks(
+        self, tmp_path, origin_repo
+    ):
+        settings = make_inspection_settings(tmp_path)
+        transport = FakePlannerTransport()
+
+        result, gitlab = run_plan_workflow(
+            origin_repo,
+            settings,
+            transport,
+            labels=["agent::plan", "agent::approved"],
+        )
+
+        # Approval is invalidated purely by removing the agent::approved
+        # label: the recorded transitions prove it, and any user/role/
+        # approval lookup would have raised AssertionError inside the fake
+        # transport already.
+        removals = [
+            sorted(call[1][3]) for call in label_writes(gitlab)
+        ]
+        assert "agent::approved" in removals[0]
+        assert gitlab.issue["labels"] == ["agent::needs-review"]
+        assert result["status"] == STATUS_PLAN_PUBLISHED
+
+
+class TestRegenerationUnderLockMutation:
+    def test_approval_added_between_routing_and_lock_is_invalidated_not_blocking(
+        self, tmp_path, origin_repo
+    ):
+        # Routing saw exactly agent::plan; a human added agent::approved
+        # before the lock was acquired. The under-lock re-read now sees a
+        # regeneration request, so the run proceeds and invalidates the new
+        # approval instead of blocking.
+        settings = make_inspection_settings(tmp_path)
+        transport = FakePlannerTransport()
+        gitlab = LabelMutationTransport(
+            make_project_with_origin(origin_repo),
+            make_issue(["agent::plan"]),
+            mutated_labels=["agent::plan", "agent::approved"],
+        )
+
+        result, gitlab = run_plan_workflow(
+            origin_repo, settings, transport, gitlab=gitlab
+        )
+
+        assert result["status"] == STATUS_PLAN_PUBLISHED
+        agent_labels = [
+            label for label in gitlab.issue["labels"] if label.startswith("agent::")
+        ]
+        assert agent_labels == ["agent::needs-review"]
+        activation = result["label_outcomes"][0]
+        assert activation["invalidated_labels"] == ["agent::approved"]
+
+
+class TestRegenerationConflictingRequirements:
+    def test_conflicting_requirements_regenerate_non_executable_with_explicit_questions(
+        self, tmp_path, origin_repo
+    ):
+        settings = make_inspection_settings(tmp_path)
+        content = {
+            **make_plan_content(),
+            "unresolved_questions": [
+                "Should the greeting be localized, and to which locales?"
+            ],
+        }
+        transport = FakePlannerTransport(
+            synthesis_summary=json.dumps(content, sort_keys=True)
+        )
+        notes = [
+            seeded_plan_note(version=1, publication_uid="uid-seed-v1"),
+            {
+                "body": "Actually the greeting must ALSO support right-to-left layouts.",
+                "author": {"name": "Bob"},
+                "created_at": "2026-11-02T10:00:00Z",
+            },
+        ]
+
+        result, gitlab = run_plan_workflow(
+            origin_repo,
+            settings,
+            transport,
+            labels=["agent::plan", "agent::approved"],
+            notes=notes,
+        )
+
+        # Conflicting requirements: published, but explicitly NOT executable.
+        assert result["status"] == STATUS_PLAN_NEEDS_CLARIFICATION
+        publication = result["plan_publication"]
+        assert publication["version"] == 2
+        assert publication["executable"] is False
+        assert publication["unresolved_questions_count"] == 1
+        assert "CLARIFICATION REQUIRED" in publication["note_body"]
+        assert "which locales" in publication["note_body"]
+        # The invalidated approval still ends at needs-review.
+        assert gitlab.issue["labels"] == ["agent::needs-review"]
+        assert publication["label_outcome"] == "transitioned_to_needs_review"
+
+
+class TestRegenerationBlockedByMalformedLatestPlan:
+    def test_malformed_latest_record_fails_synthesis_without_fallback_or_publication(
+        self, tmp_path, origin_repo
+    ):
+        settings = make_inspection_settings(tmp_path)
+        transport = FakePlannerTransport()
+        # The latest record is malformed in a way that leaves its VERSION
+        # undeterminable (marker attr mangled AND fenced JSON mangled):
+        # allocation must refuse a possibly-colliding version instead of
+        # falling back to the older v1 record.
+        broken_v2 = plan_note_body(
+            make_plan(
+                project_id=PROJECT_ID,
+                project_path="group/demo",
+                issue_iid=ISSUE_IID,
+                version=2,
+                plan_id="PLAN-v2",
+                publication_uid="uid-broken-v2",
+            )
+        )
+        broken_v2 = broken_v2.replace(
+            "version=2 ", "version=v-two "
+        ).replace("```json\n{", "```json\n{broken: ,")
+
+        result, gitlab = run_plan_workflow(
+            origin_repo,
+            settings,
+            transport,
+            labels=["agent::plan", "agent::approved"],
+            notes=[
+                seeded_plan_note(version=1, publication_uid="uid-seed-v1"),
+                {"body": broken_v2},
+            ],
+        )
+
+        # The latest record is malformed: the run fails truthfully instead
+        # of falling back to v1 or publishing a duplicate.
+        assert result["status"] == STATUS_PLAN_SYNTHESIS_FAILED
+        assert "not fall back" in result["error_message"] or "version" in result["error_message"]
+        assert note_posts(gitlab) == []
+        # Nothing was published and the Issue truthfully stays in-progress;
+        # no identity lookups occurred (the fake transport would raise).
+        agent_labels = [
+            label for label in gitlab.issue["labels"] if label.startswith("agent::")
+        ]
+        assert agent_labels == ["agent::in-progress"]
+
+
+# ---------------------------------------------------------------------------
 # Spec (a)1 — Issue labels re-read under the lock before the transition
 # ---------------------------------------------------------------------------
 
@@ -607,23 +818,25 @@ class TestLabelsMutatedUnderLock:
         gitlab = LabelMutationTransport(
             make_project_with_origin(origin_repo),
             make_issue(["agent::plan"]),
-            mutated_labels=["agent::plan", "agent::approved"],
+            mutated_labels=["agent::plan", "agent::in-progress"],
         )
 
         result, gitlab = run_plan_workflow(
             origin_repo, settings, transport, gitlab=gitlab
         )
 
-        # Truthful blocked terminal: the Issue no longer carries exactly
-        # agent::plan under the lock, so nothing acts on the stale routing.
+        # Truthful blocked terminal: the Issue no longer carries a valid Plan
+        # request (agent::plan, optionally with agent::approved or
+        # agent::needs-review) under the lock, so nothing acts on the stale
+        # routing.
         assert result["status"] == STATUS_INSPECTION_BLOCKED
         message = result["error_message"]
-        assert "no longer carries exactly agent::plan" in message
-        assert "agent::approved" in message
+        assert "no longer carries a valid Plan request state" in message
+        assert "agent::in-progress" in message
         # No label transition happened at all: the mutated labels survive
         # untouched and no needs-review was applied.
         assert not label_writes(gitlab)
-        assert gitlab.issue["labels"] == ["agent::plan", "agent::approved"]
+        assert gitlab.issue["labels"] == ["agent::plan", "agent::in-progress"]
         # Nothing was published (no plan comment, no needs-review transition).
         assert note_posts(gitlab) == []
         assert "agent::needs-review" not in gitlab.issue["labels"]
@@ -634,7 +847,7 @@ class TestLabelsMutatedUnderLock:
             if outcome["outcome"] == "blocked_labels_changed"
         ]
         assert len(blocked) == 1
-        assert blocked[0]["found_labels"] == ["agent::plan", "agent::approved"]
+        assert blocked[0]["found_labels"] == ["agent::plan", "agent::in-progress"]
         # The planner never ran: blocked before the clone/inspection.
         assert transport.calls == []
         # finalize_inspection ran on the failure routing: the lock is released.

@@ -600,7 +600,9 @@ def build_plan_graph(
 
     Flow (§7): validate setup → create operation context → acquire the Issue
     lock → **activate_issue** (agent::plan → agent::in-progress label
-    transition) → prepare a fresh inspection clone at the baseline branch →
+    transition; a Ticket-05 regeneration request — agent::plan plus exactly
+    one prior review/approval state — also invalidates that prior state
+    here) → prepare a fresh inspection clone at the baseline branch →
     run the read-only inspection Planner through the injectable transport →
     record inspection evidence → **synthesize_plan** (re-read ALL Issue
     comments under the lock, allocate the next plan version, run the planner
@@ -700,6 +702,9 @@ def build_plan_graph(
         # Explicit label transition agent::plan → agent::in-progress (§3.2),
         # using add/remove operations only so unrelated labels survive. The
         # failure is truthful and terminal: no inspection, no publication.
+        # Ticket 05: a regeneration request (agent::plan plus exactly one
+        # prior review/approval state) also invalidates that prior state
+        # here — the approval is reset for EVERY regeneration.
         issue_iid = state["issue_iid"]
         project_id = state["project"]["id"]
         outcome = {
@@ -732,7 +737,13 @@ def build_plan_graph(
             }
         fresh_labels = [str(label) for label in (fresh_issue.get("labels") or [])]
         recognized = _recognized_labels(fresh_labels, ISSUE_AGENT_STATES)
-        if recognized != [PLAN_TRIGGER]:
+        invalidated = [label for label in recognized if label in PRIOR_PLAN_STATES]
+        valid_regeneration = (
+            PLAN_TRIGGER in recognized
+            and len(recognized) == 2
+            and len(invalidated) == 1
+        )
+        if recognized != [PLAN_TRIGGER] and not valid_regeneration:
             blocked = {
                 **outcome,
                 "outcome": "blocked_labels_changed",
@@ -741,24 +752,29 @@ def build_plan_graph(
             return {
                 "status": STATUS_INSPECTION_BLOCKED,
                 "error_message": (
-                    f"Issue #{issue_iid} no longer carries exactly "
-                    f"{PLAN_TRIGGER} under the Issue lock; its current "
-                    f"recognized agent labels are: "
-                    f"{_describe_labels(sorted(recognized))} (all labels: "
-                    f"{_describe_labels(fresh_labels)}). The Issue state "
-                    "changed after routing — possibly a human transitioned "
-                    "or approved it. Nothing was transitioned, no inspection "
-                    "clone was prepared, nothing was published, and no other "
-                    "labels were touched. Re-run with the Issue carrying "
-                    f"exactly {PLAN_TRIGGER} to start a fresh Plan."
+                    f"Issue #{issue_iid} no longer carries a valid Plan "
+                    f"request state ({PLAN_TRIGGER}, optionally together "
+                    f"with exactly one of "
+                    f"{_describe_labels(sorted(PRIOR_PLAN_STATES))}) under "
+                    f"the Issue lock; its current recognized agent labels "
+                    f"are: {_describe_labels(sorted(recognized))} (all "
+                    f"labels: {_describe_labels(fresh_labels)}). The Issue "
+                    "state changed after routing — possibly a human "
+                    "transitioned or approved it. Nothing was transitioned, "
+                    "no inspection clone was prepared, nothing was "
+                    "published, and no other labels were touched. Re-run "
+                    f"with the Issue carrying exactly {PLAN_TRIGGER} (plus "
+                    "optionally one prior review/approval state to "
+                    "regenerate) to start a fresh Plan."
                 ),
                 "label_outcomes": [blocked],
             }
+        removed_labels = ["agent::plan", *invalidated]
         try:
             _gitlab().update_issue_labels(
                 project_id,
                 issue_iid,
-                remove_labels=["agent::plan"],
+                remove_labels=removed_labels,
                 add_labels=["agent::in-progress"],
             )
         except _GITLAB_FAILURES as exc:
@@ -777,7 +793,13 @@ def build_plan_graph(
                 ),
                 "label_outcomes": [failure],
             }
-        return {"label_outcomes": [{**outcome, "outcome": "transitioned"}]}
+        transitioned = {**outcome, "outcome": "transitioned"}
+        if invalidated:
+            # Ticket 05: the prior review/approval state was invalidated —
+            # recorded truthfully so the regeneration is auditable.
+            transitioned["removed_labels"] = removed_labels
+            transitioned["invalidated_labels"] = invalidated
+        return {"label_outcomes": [transitioned]}
 
     def prepare_inspection_clone(state: WorkflowState) -> dict[str, Any]:
         context = state["operation_context"]
