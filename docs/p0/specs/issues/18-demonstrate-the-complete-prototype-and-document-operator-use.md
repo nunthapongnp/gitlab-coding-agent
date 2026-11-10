@@ -1,3 +1,5 @@
+> **Superseded historical design:** Use the [current Phase 0 manual workflow contract](../../MANUAL_WORKFLOW_CONTRACT.md) and GitHub Issue #6 with its linked slices. Conflicting requirements below are inactive, including label-selected modes, plan versions, mandatory Docker, per-Task commits, partial publication, and the old runtime limit.
+
 # 18: Demonstrate the complete prototype and document operator use
 
 **What to build:** Run the full disposable-Project happy path from Issue to reviewed MR delivery, with operator instructions and evidence that the accepted prototype limits hold.

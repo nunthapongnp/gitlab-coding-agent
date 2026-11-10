@@ -124,9 +124,9 @@ def _run_one_check(
         if not args:
             raise ValueError("Command is empty")
         env = os.environ.copy()
-        # Do not expose GitLab/Ollama credentials to project-controlled build scripts.
+        # Do not expose publication/model credentials to project-controlled scripts.
         env.pop("GITLAB_TOKEN", None)
-        env.pop("OLLAMA_API_KEY", None)
+        env.pop("LLM_API_KEY", None)
         env.update({"CI": "true", "NONINTERACTIVE": "1", "PYTHONUNBUFFERED": "1"})
         completed = subprocess.run(
             args,

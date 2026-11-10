@@ -1,3 +1,5 @@
+> **Superseded historical design:** Use the [current Phase 0 manual workflow contract](../../MANUAL_WORKFLOW_CONTRACT.md) and GitHub Issue #6 with its linked slices. Conflicting requirements below are inactive, including label-selected modes, plan versions, mandatory Docker, per-Task commits, partial publication, and the old runtime limit.
+
 # 16: Push only reviewed commits to the existing MR branch
 
 **What to build:** Publish the reviewed Run commit set through a normal push to the user's existing source branch and report delivery and verification independently.

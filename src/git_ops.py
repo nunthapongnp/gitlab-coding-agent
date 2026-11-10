@@ -47,7 +47,7 @@ def _git_auth_env(token: str | None, username: str = "oauth2") -> dict[str, str]
     env["GIT_TERMINAL_PROMPT"] = "0"
     env["GCM_INTERACTIVE"] = "never"
     env.pop("GITLAB_TOKEN", None)
-    env.pop("OLLAMA_API_KEY", None)
+    env.pop("LLM_API_KEY", None)
     if token:
         # Send credentials through a one-shot Git configuration environment;
         # they are not put in the remote URL or persisted .git/config.
@@ -137,7 +137,7 @@ def commit_and_push_branch(
 
     env = os.environ.copy()
     env.pop("GITLAB_TOKEN", None)
-    env.pop("OLLAMA_API_KEY", None)
+    env.pop("LLM_API_KEY", None)
     env.update(
         {
             "GIT_AUTHOR_NAME": author_name,

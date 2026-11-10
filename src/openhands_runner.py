@@ -70,9 +70,9 @@ def run_openhands(
         ) from exc
 
     llm = LLM(
-        model=f"openai/{settings.ollama_model}",
-        api_key=settings.ollama_api_key,
-        base_url=f"{settings.ollama_base_url}/v1",
+        model=settings.llm_model if settings.llm_model.startswith("openai/") else f"openai/{settings.llm_model}",
+        api_key=settings.llm_api_key,
+        base_url=settings.llm_base_url,
         timeout=settings.timeout_seconds,
     )
     agent = Agent(
@@ -96,7 +96,7 @@ def run_openhands(
         )
     )
 
-    hidden = {key: os.environ.pop(key) for key in ("GITLAB_TOKEN", "OLLAMA_API_KEY") if key in os.environ}
+    hidden = {key: os.environ.pop(key) for key in ("GITLAB_TOKEN", "LLM_API_KEY") if key in os.environ}
     try:
         conversation.run()
     finally:

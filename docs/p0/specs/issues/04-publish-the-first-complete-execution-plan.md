@@ -1,3 +1,5 @@
+> **Superseded historical design:** Use the [current Phase 0 manual workflow contract](../../MANUAL_WORKFLOW_CONTRACT.md) and GitHub Issue #6 with its linked slices. Conflicting requirements below are inactive, including label-selected modes, plan versions, mandatory Docker, per-Task commits, partial publication, and the old runtime limit.
+
 # 04: Publish the first complete Execution Plan
 
 **What to build:** Request Plan for a clear Issue and receive one complete Markdown/JSON plan comment and an Issue ready for human review.
