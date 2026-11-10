@@ -9,7 +9,7 @@ A complete, versioned description of the requirement, affected modules, tasks, d
 _Avoid_: Conversation history, agent memory
 
 **Approved Plan**:
-The latest published Execution Plan, provided it is executable and its Issue carries `agent::approved` with no conflicting agent status label.
+The latest published Execution Plan, provided it is executable and its Issue carries `agent::approved` with no conflicting agent status label. Regenerating the plan (a new `agent::plan` request together with one prior review/approval state) invalidates a prior approval: the Issue returns to `agent::needs-review` and must be approved again.
 _Avoid_: Approved conversation, approved workspace
 
 **Task**:

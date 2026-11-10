@@ -314,6 +314,55 @@ class TestLabelRoutingPlan:
         assert result.mr is None
 
 
+class TestPlanRegenerationRouting:
+    """Ticket 05: agent::plan re-request on an Issue that already has a plan.
+
+    After a first plan the Issue rests at agent::needs-review (or
+    agent::approved after human review). A human re-requesting Plan adds
+    agent::plan, so routing must accept exactly ``agent::plan`` plus ONE
+    prior review/approval state as a regeneration request. Every other
+    multi-label combination stays rejected, and approval stays label-values
+    only (no user/role/approval lookup — the fake transport would raise).
+    """
+
+    @pytest.mark.parametrize("prior_label", ["agent::approved", "agent::needs-review"])
+    def test_plan_plus_one_prior_state_routes_to_plan_as_regeneration(
+        self, settings, prior_label
+    ):
+        transport = FakeGitLabTransport(
+            make_project(), make_issue(["agent::plan", prior_label])
+        )
+
+        result = route(transport)
+
+        assert result.mode == MODE_PLAN
+        assert result.baseline_branch == "main"
+        assert result.prior_agent_state == prior_label
+        assert result.issue_agent_labels == sorted(["agent::plan", prior_label])
+        transport.assert_only_reads()
+
+    def test_fresh_plan_request_carries_no_prior_state(self, settings):
+        transport = FakeGitLabTransport(make_project(), make_issue(["agent::plan"]))
+
+        result = route(transport)
+
+        assert result.mode == MODE_PLAN
+        assert result.prior_agent_state is None
+        assert result.issue_agent_labels == ["agent::plan"]
+
+    def test_plan_plus_approved_plus_needs_review_still_rejects(self, settings):
+        labels = ["agent::plan", "agent::approved", "agent::needs-review"]
+        transport = FakeGitLabTransport(make_project(), make_issue(labels))
+
+        with pytest.raises(RoutingRejection) as excinfo:
+            route(transport)
+
+        assert excinfo.value.status == STATUS_REJECTED
+        assert excinfo.value.mode is None
+        assert "conflicting agent labels" in str(excinfo.value)
+        transport.assert_only_reads()
+
+
 class TestPlanBaselineMatrix:
     """Baseline selection matrix for Plan (implementation plan §3.3)."""
 
@@ -588,7 +637,7 @@ class TestLabelRoutingRejections:
             [],
             ["agent::in-progress"],
             ["agent::needs-review"],
-            ["agent::plan", "agent::approved"],
+            ["agent::plan", "agent::in-progress"],
             ["agent::approved", "agent::needs-review"],
             ["agent::plan", "agent::in-progress", "agent::needs-review"],
         ],
