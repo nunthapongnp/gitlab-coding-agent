@@ -52,6 +52,12 @@ INSPECTION_TERMINAL_STATUSES = frozenset(
     {STATUS_INSPECTION_COMPLETE, STATUS_INSPECTION_FAILED, STATUS_INSPECTION_BLOCKED}
 )
 
+# Ticket 05: a re-requested Plan on an Issue that already has a published
+# plan arrives as agent::plan on top of the prior review/approval state.
+# Exactly one such prior state alongside the trigger is a regeneration
+# request; every prior state is invalidated when the run activates the Issue.
+PRIOR_PLAN_STATES = frozenset({ISSUE_APPROVED_TRIGGER, "agent::needs-review"})
+
 # Failure terminals that route the Plan graph to finalize (lock release).
 # Success terminals (plan_published / plan_needs_clarification) route through
 # request_review first; inspection_complete now continues into synthesis, and
@@ -87,6 +93,7 @@ class WorkflowState(TypedDict, total=False):
     issue: dict[str, Any]
     project: dict[str, Any]
     issue_agent_labels: list[str]
+    prior_agent_state: str | None
     related_mrs: list[dict[str, Any]]
     mr: dict[str, Any]
     baseline_branch: str
@@ -149,6 +156,9 @@ class RoutingResult:
     baseline_branch: str | None = None
     mr: dict[str, Any] | None = None
     open_mrs: list[dict[str, Any]] = field(default_factory=list)
+    # Ticket 05: the prior review/approval state label a regeneration run
+    # must invalidate (None for a fresh Plan or an Execute request).
+    prior_agent_state: str | None = None
 
 
 def _recognized_labels(labels: list[str], known: frozenset[str]) -> list[str]:
@@ -165,6 +175,21 @@ def _unrecognized_agent_labels(labels: list[str], known: frozenset[str]) -> list
 
 def _describe_labels(labels: list[str]) -> str:
     return ", ".join(labels) if labels else "(none)"
+
+
+def _plan_regeneration_prior_state(recognized: list[str]) -> str | None:
+    """Return the invalidated prior state for a regeneration request, if any.
+
+    Ticket 05: ``agent::plan`` together with exactly ONE prior review or
+    approval state (``agent::approved`` / ``agent::needs-review``) is how a
+    human re-requests a Plan on an Issue that already has a published plan.
+    Any other combination (``agent::in-progress`` alongside the trigger, or
+    more than two recognized states) is not a regeneration request.
+    """
+    if len(recognized) != 2 or PLAN_TRIGGER not in recognized:
+        return None
+    prior = [label for label in recognized if label in PRIOR_PLAN_STATES]
+    return prior[0] if len(prior) == 1 else None
 
 
 def _issue_label_advice() -> str:
@@ -381,17 +406,25 @@ def route_issue_request(
     issue = gitlab.get_issue(project_id, issue_iid)
     labels = [str(label) for label in (issue.get("labels") or [])]
     recognized = _recognized_labels(labels, ISSUE_AGENT_STATES)
-    if len(recognized) != 1:
+    prior_state = _plan_regeneration_prior_state(recognized)
+    if len(recognized) != 1 and prior_state is None:
         raise _reject_issue_state(issue_iid, labels)
     trigger = recognized[0]
 
-    if trigger not in (PLAN_TRIGGER, ISSUE_APPROVED_TRIGGER):
+    if prior_state is None and trigger not in (
+        PLAN_TRIGGER,
+        ISSUE_APPROVED_TRIGGER,
+    ):
         # agent::in-progress / agent::needs-review are valid single states but
         # not requests to start work; reject at the Issue-state boundary
         # before any related-MR read or product activity.
         raise _reject_issue_state(issue_iid, labels)
 
-    if trigger == PLAN_TRIGGER:
+    if trigger == PLAN_TRIGGER or prior_state is not None:
+        # Fresh Plan request or a Ticket-05 regeneration request: both take
+        # the Plan flow. A regeneration carries agent::plan plus exactly one
+        # prior review/approval state (in any label order); activate_issue
+        # invalidates that prior state under the Issue lock.
         if branch_override is not None:
             # Case 1: the explicit override wins outright; related MRs are
             # irrelevant to the baseline and are not even read.
@@ -409,8 +442,9 @@ def route_issue_request(
             mode=MODE_PLAN,
             project=project,
             issue=issue,
-            issue_agent_labels=[trigger],
+            issue_agent_labels=sorted(recognized),
             baseline_branch=baseline_branch,
+            prior_agent_state=prior_state,
         )
 
     # agent::approved: Execute selection requires one open related MR that
@@ -1292,7 +1326,9 @@ def run_routed_workflow(
         "project": routing.project,
         "issue_agent_labels": routing.issue_agent_labels,
         "related_mrs": routing.open_mrs,
-        # Verification hints remain optional plumbing for the mode graphs.
+        # Ticket 05: None for a fresh Plan / Execute; the invalidated prior
+        # review/approval state label for a regeneration request.
+        "prior_agent_state": routing.prior_agent_state,        # Verification hints remain optional plumbing for the mode graphs.
         "verification_hints": {
             "setup_command": settings.setup_command,
             "build_command": settings.build_command,
