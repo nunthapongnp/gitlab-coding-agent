@@ -5,6 +5,9 @@ from typing import Any
 
 import requests
 
+RECOGNIZED_LABELS = {'agent::explore', 'agent::implement', 'agent::in-progress',
+                     'agent::needs-review', 'agent::approved'}
+
 
 class GitLabAPIError(RuntimeError):
     pass
@@ -83,6 +86,21 @@ class GitLabClient:
                 return notes
             notes.extend(payload)
             page += 1
+
+    def replace_issue_status(self, project, issue_iid, expected, replacement):
+        issue = self.get_issue(project, issue_iid)
+        if set(issue.get('labels', [])) & RECOGNIZED_LABELS != {expected}:
+            raise GitLabAPIError('Issue workflow labels changed; manual review required')
+        payload = self._request('PUT',
+            f'projects/{self._project_path(project)}/issues/{issue_iid}',
+            json={'remove_labels': expected, 'add_labels': replacement})
+        if not isinstance(payload, dict) or set(payload.get('labels', [])) & RECOGNIZED_LABELS != {replacement}:
+            raise GitLabAPIError('Issue label replacement was not confirmed')
+        return payload
+
+    def create_issue_note(self, project, issue_iid, body):
+        return self._request('POST', f'projects/{self._project_path(project)}/issues/{issue_iid}/notes',
+                             json={'body': body})
 
     def find_open_merge_request(
         self, project: str | int, source_branch: str, target_branch: str

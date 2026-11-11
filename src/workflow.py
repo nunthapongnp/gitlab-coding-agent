@@ -104,12 +104,12 @@ class Application:
             from .explore import InspectionError, inspect
             try:
                 workspace, inspection = inspect(request, settings, self.services)
-                return OperationOutcome(OutcomeStatus.UNAVAILABLE,
-                    'Read-only inspection complete; plan review/publication is not enabled. No executable plan published.',
+                return OperationOutcome(OutcomeStatus.SUCCESS,
+                    'Execution Plan published; replace agent::needs-review with agent::approved after human review.',
                     inspection, workspace.checkout, workspace.artifacts)
             except InspectionError as exc:
                 return OperationOutcome(OutcomeStatus.FAILED, str(exc),
-                    workspace=exc.workspace.checkout, diagnostics=exc.workspace.artifacts)
+                    inspection=exc.inspection, workspace=exc.workspace.checkout, diagnostics=exc.workspace.artifacts)
             except ValueError as exc:
                 return OperationOutcome(OutcomeStatus.FAILED, str(exc))
             except Exception:

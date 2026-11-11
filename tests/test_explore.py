@@ -35,6 +35,18 @@ class GitLab:
 
     def __init__(self, source):
         self.source = source
+        self.labels = list(type(self).labels)
+        self.notes = list(type(self).notes)
+        self.transitions = []
+
+    def replace_issue_status(self, project, iid, expected, replacement):
+        self.transitions.append((expected, replacement))
+        self.labels = [label for label in self.labels if label != expected] + [replacement]
+
+    def create_issue_note(self, project, iid, body):
+        note = {'id': 123, 'body': body}
+        self.notes.append(note)
+        return note
 
     def get_project(self, project):
         return {'id': 42, 'default_branch': 'main', 'http_url_to_repo': str(self.source)}
@@ -61,7 +73,7 @@ def plan():
             'commands': [], 'unresolved_questions': []}
 
 
-def test_explore_inspects_fresh_checkout_and_returns_unpublished_observations(source, tmp_path):
+def test_explore_publishes_one_consistent_agreement_from_fresh_inspection(source, tmp_path):
     from src.runtime import LocalRuntime
 
     contexts = []
@@ -81,18 +93,32 @@ def test_explore_inspects_fresh_checkout_and_returns_unpublished_observations(so
             tools.call('read', '../artifacts/plan.json')
         return plan()
 
+    client = GitLab(source)
     app = Application(settings=settings(tmp_path), services=ApplicationServices(
-        gitlab=GitLab(source), role_runtime=LocalRuntime(model_runner=model)))
+        gitlab=client, role_runtime=LocalRuntime(model_runner=model)))
     first = app.invoke(OperationInput('explore', 'team/demo', 2))
+    from src.agreement import parse_plan_comment
+    agreement = parse_plan_comment(client.notes[0]['body'], project_id=42, issue_iid=2)
+    assert first.status == OutcomeStatus.SUCCESS
+    assert agreement['scope'] == ['frontend', 'backend']
+    assert agreement['acceptance'] == [{'id': 'A1', 'description': 'Task IDs visible'}]
+    assert agreement['commands'] == []
+    assert 'Task IDs visible' in client.notes[0]['body']
+    with pytest.raises(ValueError, match='differs'):
+        parse_plan_comment(client.notes[0]['body'].replace('## Requirement\nShow task IDs',
+                                                        '## Requirement\nDelete all tasks'),
+                           project_id=42, issue_iid=2)
+    assert client.transitions == [('agent::explore', 'agent::in-progress'),
+                                  ('agent::in-progress', 'agent::needs-review')]
+    assert client.labels == ['team', 'agent::needs-review']
     second = app.invoke(OperationInput('explore', 'team/demo', 2))
-    assert first.status == OutcomeStatus.UNAVAILABLE
+    assert second.status == OutcomeStatus.FAILED
+    assert len(client.notes) == 1
     assert first.inspection['commit'] == initial[0]
     assert first.inspection['project_id'] == 42
     assert first.inspection['modules'] == ['backend', 'frontend']
     assert first.inspection['plan']['requirement'] == 'Show task IDs'
-    assert first.workspace != second.workspace
-    assert len(contexts) == 2
-    assert contexts[0]['context_id'] != contexts[1]['context_id']
+    assert len(contexts) == 1
     assert first.workspace.name == 'checkout'
     assert first.diagnostics.parent == first.workspace.parent
     assert first.diagnostics != first.workspace
@@ -137,16 +163,26 @@ def test_explore_fetches_every_page_of_issue_discussion(source, tmp_path):
     from src.gitlab_client import GitLabClient
     from src.runtime import LocalRuntime
 
+    state = GitLab(source)
+
     class Transport:
         def request(self, method, url, **kwargs):
-            assert method == 'GET'
             response = requests.Response()
             response.status_code = 200
-            if url.endswith('/notes'):
+            if method == 'PUT':
+                assert kwargs['json'] in [
+                    {'remove_labels': 'agent::explore', 'add_labels': 'agent::in-progress'},
+                    {'remove_labels': 'agent::in-progress', 'add_labels': 'agent::needs-review'}]
+                state.replace_issue_status(42, 2, kwargs['json']['remove_labels'], kwargs['json']['add_labels'])
+                body = state.get_issue(42, 2)
+            elif method == 'POST':
+                assert url.endswith('/notes')
+                body = state.create_issue_note(42, 2, kwargs['json']['body'])
+            elif url.endswith('/notes'):
                 page = kwargs['params']['page']
                 body = [{'body': 'Discussion ' + str(page)}] if page < 3 else []
             elif url.endswith('/issues/2'):
-                body = GitLab(source).get_issue(42, 2)
+                body = state.get_issue(42, 2)
             else:
                 body = GitLab(source).get_project(42)
             response._content = json.dumps(body).encode()
@@ -164,6 +200,8 @@ def test_explore_fetches_every_page_of_issue_discussion(source, tmp_path):
         gitlab=client, role_runtime=LocalRuntime(model_runner=model))).invoke(
             OperationInput('explore', 'team/demo', 2))
     assert result.inspection is not None
+    assert result.succeeded
+    assert state.labels == ['team', 'agent::needs-review']
 
 
 @pytest.mark.parametrize('behavior', ['mutate', 'malformed', 'crash'])
@@ -186,6 +224,8 @@ def test_planner_failures_preserve_diagnostics_without_claiming_success(source, 
     assert result.diagnostics.is_dir()
     assert (result.diagnostics / 'failure.json').is_file()
     assert 'secret-' not in (result.diagnostics / 'failure.json').read_text()
+    if behavior == 'malformed':
+        assert 'fields are missing' in result.message
     assert git(source, 'status', '--porcelain') == ''
 
 
@@ -253,11 +293,101 @@ def test_cli_default_workspace_is_outside_framework_checkout(source, tmp_path, m
                 environ={'GITLAB_TOKEN': 'secret-gitlab', 'LLM_API_KEY': 'secret-model',
                          'LLM_BASE_URL': 'https://proxy.example/v1', 'LLM_MODEL': 'team-model'},
                 services=ApplicationServices(gitlab=GitLab(source),
-                    role_runtime=LocalRuntime(model_runner=model)), stderr=output)
-    assert code == 4
+                    role_runtime=LocalRuntime(model_runner=model)), stdout=output)
+    assert code == 0
     assert len(observed) == 1
     assert not observed[0].is_relative_to(Path.cwd())
-    assert 'inspection complete' in output.getvalue()
+    assert 'Execution Plan published' in output.getvalue()
+
+
+@pytest.mark.parametrize('problem', ['questions', 'mapping', 'missing-command', 'bad-cwd'])
+def test_planner_agreement_validation_blocks_unsafe_work_but_commands_are_optional(source, tmp_path, problem):
+    from src.runtime import LocalRuntime
+    proposal = plan()
+    if problem == 'questions':
+        proposal['unresolved_questions'] = ['Which task identifier format?']
+    elif problem == 'mapping':
+        proposal['checklist'][0]['acceptance_ids'] = ['A404']
+    elif problem == 'bad-cwd':
+        proposal['commands'] = [{'argv': ['npm', 'test'], 'cwd': '../outside',
+                                 'module': 'frontend', 'evidence': 'package.json'}]
+    else:
+        del proposal['commands']
+    client = GitLab(source)
+    result = Application(settings=settings(tmp_path), services=ApplicationServices(
+        gitlab=client, role_runtime=LocalRuntime(model_runner=lambda **context: proposal))).invoke(
+            OperationInput('explore', 'team/demo', 2))
+    assert client.labels == ['team', 'agent::needs-review']
+    if problem == 'missing-command':
+        assert result.succeeded
+        assert result.inspection['agreement']['commands'] == []
+    else:
+        assert result.status == OutcomeStatus.FAILED
+        assert 'No executable plan published' in result.message
+        assert all('<!-- coding-agent:execution-plan -->' not in note['body'] for note in client.notes)
+        assert 'agent::approved' not in client.labels
+        if problem == 'questions':
+            assert 'Which task identifier format?' in result.message
+
+
+@pytest.mark.parametrize('delivered', [True, False])
+def test_uncertain_plan_post_reads_back_without_duplicate_delivery(source, tmp_path, delivered):
+    from src.runtime import LocalRuntime
+    from src.agreement import parse_plan_comment
+
+    class UncertainGitLab(GitLab):
+        attempts = 0
+
+        def create_issue_note(self, project, iid, body):
+            self.attempts += 1
+            if delivered:
+                super().create_issue_note(project, iid, body)
+            raise TimeoutError('secret-gitlab must not escape')
+
+    client = UncertainGitLab(source)
+    result = Application(settings=settings(tmp_path), services=ApplicationServices(
+        gitlab=client, role_runtime=LocalRuntime(model_runner=lambda **context: plan()))).invoke(
+            OperationInput('explore', 'team/demo', 2))
+    assert client.attempts == 1
+    assert result.succeeded == delivered
+    assert 'secret-gitlab' not in result.message
+    if delivered:
+        assert client.labels == ['team', 'agent::needs-review']
+        assert parse_plan_comment(client.notes[0]['body'], project_id=42, issue_iid=2)['requirement'] == 'Show task IDs'
+        assert result.inspection['published'] is True
+    else:
+        assert client.notes == []
+        assert 'uncertain' in result.message
+        assert client.labels == ['team', 'agent::in-progress']
+
+
+def test_prior_plan_on_later_discussion_page_blocks_explore_before_workspace(source, tmp_path):
+    import requests
+    from src.gitlab_client import GitLabClient
+
+    class Transport:
+        def request(self, method, url, **kwargs):
+            assert method == 'GET'
+            if url.endswith('/notes'):
+                page = kwargs['params']['page']
+                body = {1: [{'body': 'Ordinary comment'}],
+                        2: [{'body': '<!-- coding-agent:execution-plan --> even malformed plans block replan'}]}.get(page, [])
+            elif url.endswith('/issues/2'):
+                body = GitLab(source).get_issue(42, 2)
+            else:
+                body = GitLab(source).get_project(42)
+            response = requests.Response()
+            response.status_code = 200
+            response._content = json.dumps(body).encode()
+            return response
+
+    client = GitLabClient('https://gitlab.test')
+    client.session = Transport()
+    result = Application(settings=settings(tmp_path), services=ApplicationServices(gitlab=client)).invoke(
+        OperationInput('explore', 'team/demo', 2))
+    assert result.status == OutcomeStatus.FAILED
+    assert 'clear obsolete recognized status/approval labels' in result.message
+    assert not (tmp_path / 'runs').exists()
 
 
 def test_application_cancels_timed_out_local_command_and_its_child(source, tmp_path):
