@@ -46,9 +46,12 @@ class RunContext:
 
 
 class RunPreparationError(RuntimeError):
-    def __init__(self, context, message):
+    def __init__(self, context, message, *, cause=None):
         super().__init__(message)
         self.context = context
+        # This stays in memory until the finalizer redacts it for every output.
+        self.failure = {'phase': 'preparation', 'error_type': type(cause).__name__,
+                        'message': str(cause)} if cause is not None else None
 
 
 def _linked(mr, related, project, issue_iid):
@@ -140,7 +143,8 @@ def prepare_run(request, settings, services):
         if branch != context.source_branch:
             raise RuntimeError('Fresh checkout does not match the selected source branch')
         (context.artifacts / 'run-context.json').write_text(json.dumps(context.metadata(), indent=2), encoding='utf-8')
-    except Exception:
+    except Exception as exc:
         raise RunPreparationError(context,
-            'Accepted Execute Run preparation failed; coding and publication did not start. Inspect local diagnostics and MR state.') from None
+            'Accepted Execute Run preparation failed; coding and publication did not start. Inspect local diagnostics and MR state.',
+            cause=exc) from None
     return context

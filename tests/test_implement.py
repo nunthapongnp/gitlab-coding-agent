@@ -55,7 +55,11 @@ class Transport:
                 self.mr['labels'].remove(data['remove_labels'])
                 self.mr['labels'].append(data['add_labels'])
         elif path == 'projects/42/merge_requests/12/notes':
-            payload = self.mr_notes if kwargs['params']['page'] == 1 else []
+            if method == 'POST':
+                payload = {'id': 456, 'body': kwargs['json']['body']}
+                self.mr_notes.append(payload)
+            else:
+                payload = self.mr_notes if kwargs['params']['page'] == 1 else []
         elif path.startswith('projects/42/repository/branches/'):
             branch = path.removeprefix('projects/42/repository/branches/')
             payload = {'name': branch} if branch in self.branches else {'message': '404 Branch Not Found'}
@@ -110,10 +114,13 @@ def test_implement_uses_gitlab_plan_and_exact_fresh_source_without_explore_state
     assert git(result.workspace, 'status', '--porcelain') == ''
     assert (result.workspace / 'human.txt').read_text() == 'Existing human work'
     assert transport.issue['labels'] == ['team', 'agent::approved']
-    assert transport.mr == {**mr_before, 'labels': ['team', 'agent::in-progress']}
-    assert [(method, path, data) for method, path, data in transport.calls if method != 'GET'] == [
+    assert transport.mr == {**mr_before, 'labels': ['team', 'agent::needs-review']}
+    assert [(method, path, data) for method, path, data in transport.calls if method == 'PUT'] == [
         ('PUT', 'projects/42/merge_requests/12',
-         {'remove_labels': 'agent::implement', 'add_labels': 'agent::in-progress'})]
+         {'remove_labels': 'agent::implement', 'add_labels': 'agent::in-progress'}),
+        ('PUT', 'projects/42/merge_requests/12',
+         {'remove_labels': 'agent::in-progress', 'add_labels': 'agent::needs-review'})]
+    assert len(transport.mr_notes) == 1
 
 def test_accepted_run_refuses_a_checkout_of_the_wrong_branch(approved):
     from dataclasses import replace
@@ -131,7 +138,7 @@ def test_accepted_run_refuses_a_checkout_of_the_wrong_branch(approved):
     assert result.status == OutcomeStatus.FAILED
     assert result.run_context is not None
     assert result.diagnostics.exists()
-    assert transport.mr['labels'] == ['team', 'agent::in-progress']
+    assert transport.mr['labels'] == ['team', 'agent::needs-review']
 
 INVALID_REQUESTS = [
     'no-approval', 'conflicting-issue-labels', 'no-plan', 'duplicate-plan', 'malformed-plan',

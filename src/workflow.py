@@ -32,6 +32,7 @@ class OperationOutcome:
     workspace: Path | None = None
     diagnostics: Path | None = None
     run_context: Any = None
+    execution: dict | None = None
 
     @property
     def succeeded(self) -> bool:
@@ -116,15 +117,22 @@ class Application:
             except Exception:
                 return OperationOutcome(OutcomeStatus.FAILED, 'Explore failed; no executable plan published.')
         from .implement import prepare_run, RunPreparationError
+        from .reporting import finalize_run
         try:
             context = prepare_run(request, settings, self.services)
         except RunPreparationError as exc:
+            execution = finalize_run(exc.context, {'status': 'BLOCKED', 'summary': str(exc),
+                'blockers': [str(exc)], 'errors': [exc.failure] if exc.failure else []}, settings, self.services)
             return OperationOutcome(OutcomeStatus.FAILED, str(exc),
-                workspace=exc.context.checkout, diagnostics=exc.context.artifacts, run_context=exc.context)
+                workspace=exc.context.checkout, diagnostics=exc.context.artifacts,
+                run_context=exc.context, execution=execution)
         except ValueError as exc:
             return OperationOutcome(OutcomeStatus.FAILED, str(exc))
         except Exception:
             return OperationOutcome(OutcomeStatus.FAILED, 'Implement preflight failed; no Execute Run accepted.')
-        return OperationOutcome(OutcomeStatus.UNAVAILABLE,
-            'Execute Run accepted and source prepared; implementation capability is unavailable. No coding or publication occurred.',
-            workspace=context.checkout, diagnostics=context.artifacts, run_context=context)
+        message = ('Execute Run accepted and source prepared; implementation capability is unavailable. '
+                   'No coding or publication occurred.')
+        execution = finalize_run(context, {'status': 'BLOCKED', 'summary': message,
+            'blockers': ['Implementation capability is unavailable.']}, settings, self.services)
+        return OperationOutcome(OutcomeStatus.UNAVAILABLE, message,
+            workspace=context.checkout, diagnostics=context.artifacts, run_context=context, execution=execution)
