@@ -3,6 +3,7 @@ from pathlib import Path
 import json
 from .checks import discover, verify
 from .coding import code_issue
+from .review import review_issue
 
 
 def execute_issue(context, settings, services):
@@ -49,4 +50,10 @@ def execute_issue(context, settings, services):
                      status='UNVERIFIED' if verification['status'] == 'PASS' else verification['status'])
     if verification['status'] != 'PASS':
         candidate['blockers'].append('Post-change verification did not pass; publication is withheld.')
+    else:
+        candidate['review'] = review_issue(context, candidate, settings, services)
+        candidate['acceptance_coverage'] = candidate['review'].get('acceptance_coverage', [])
+        if candidate['review']['status'] != 'PASS':
+            candidate['status'] = 'BLOCKED' if candidate['review']['status'] == 'BLOCKED' else 'FAIL'
+            candidate['blockers'].append(candidate['review'].get('reason', 'Independent review found changes requiring repair.'))
     return candidate

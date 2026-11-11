@@ -63,7 +63,7 @@ def run_sdk(context, *, sdk=None):
     finally:
         conversation.close()
     if not result:
-        raise ValueError('Planner finished without structured observations')
+        raise ValueError('Read-only role finished without structured observations')
     return result
 
 

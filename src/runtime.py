@@ -170,7 +170,7 @@ class LocalRuntime:
     def run_role(self, *, role, workspace, prompt, settings):
         if role == 'coder':
             return self._run_coder(workspace, prompt, settings)
-        if role != 'planner':
+        if role not in {'planner', 'reviewer'}:
             raise ValueError('Role is not enabled')
         model = settings.llm_model
         options = {'model': model if model.startswith('openai/') else 'openai/' + model,
@@ -185,7 +185,7 @@ class LocalRuntime:
                    for key, value in context.items() if key != 'tools'}
         # SDK discovery must not import user/project plugins, hooks, or MCP tools.
         # Set these before the fresh worker imports the SDK (discovery caches home).
-        role_home = workspace.artifacts / 'role-home'
+        role_home = workspace.artifacts / (role + '-home-' + context['context_id'])
         role_home.mkdir()
         role_env = clean_environment()
         role_env.update(HOME=str(role_home), USERPROFILE=str(role_home),
@@ -200,11 +200,11 @@ class LocalRuntime:
         try:
             stdout, stderr = self.active.communicate(json.dumps(payload), timeout=settings.timeout_seconds)
             if self.active.returncode:
-                raise RuntimeError('Planner SDK execution failed')
+                raise RuntimeError(role.capitalize() + ' SDK execution failed')
             return json.loads(stdout)
         except subprocess.TimeoutExpired:
             self.cancel()
-            raise RuntimeError('Planner timed out') from None
+            raise RuntimeError(role.capitalize() + ' timed out') from None
         finally:
             self.active = None
 

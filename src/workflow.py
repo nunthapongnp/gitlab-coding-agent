@@ -137,5 +137,5 @@ class Application:
         finally:
             context.runtime.close_coder(context.run_id)
         return OperationOutcome(OutcomeStatus.UNAVAILABLE,
-            'Local coding and verification evidence retained; review and delivery remain unavailable. No publication occurred.',
+            'Local coding, verification and independent review evidence retained; delivery remains unavailable. No publication occurred.',
             workspace=context.checkout, diagnostics=context.artifacts, run_context=context, execution=execution)

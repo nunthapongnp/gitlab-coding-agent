@@ -103,6 +103,9 @@ def test_both_modules_execute_real_existing_tests_and_exclude_generated_outputs(
             ('build', 'from pathlib import Path; Path("generated.log").write_text("build output"); print("build passed")'),
             ('test', 'print("1 test passed")')]]
     def coder(**context):
+        if json.loads(context['prompt'])['role'] == 'reviewer':
+            from test_review import approval
+            return approval(json.loads(context['prompt']))
         for path in ('frontend/task.ts', 'backend/Task.java'):
             context['tools'].call('write', path, content='task ID 2',
                 reason='Display task ID', acceptance_ids=['A1'])
@@ -113,7 +116,7 @@ def test_both_modules_execute_real_existing_tests_and_exclude_generated_outputs(
     assert len(result.execution['checks']) == 4
     assert all(row['executed'] and row['status'] == 'PASS' for row in result.execution['checks'])
     assert result.execution['baseline']['generated_files'] == ['backend/generated.log', 'frontend/generated.log']
-    assert result.execution['review']['status'] == 'NOT_RUN'
+    assert result.execution['review']['status'] == 'PASS'
     assert not result.succeeded
 
 
