@@ -121,7 +121,7 @@ class Application:
         try:
             context = prepare_run(request, settings, self.services)
         except RunPreparationError as exc:
-            execution = finalize_run(exc.context, {'status': 'BLOCKED', 'summary': str(exc),
+            execution = finalize_run(exc.context, {'status': exc.status, 'summary': str(exc),
                 'blockers': [str(exc)], 'errors': [exc.failure] if exc.failure else []}, settings, self.services)
             return OperationOutcome(OutcomeStatus.FAILED, str(exc),
                 workspace=exc.context.checkout, diagnostics=exc.context.artifacts,
@@ -136,6 +136,10 @@ class Application:
             execution = finalize_run(context, candidate, settings, self.services)
         finally:
             context.runtime.close_coder(context.run_id)
+        if execution['status'] in {'TIMEOUT', 'EXHAUSTED'}:
+            return OperationOutcome(OutcomeStatus.FAILED,
+                f"Execute Run {execution['status']}; inspect retained attempt evidence and diagnostics.",
+                workspace=context.checkout, diagnostics=context.artifacts, run_context=context, execution=execution)
         return OperationOutcome(OutcomeStatus.UNAVAILABLE,
             'Local coding, verification and independent review evidence retained; delivery remains unavailable. No publication occurred.',
             workspace=context.checkout, diagnostics=context.artifacts, run_context=context, execution=execution)

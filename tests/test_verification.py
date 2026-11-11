@@ -206,7 +206,9 @@ def test_real_postchange_regression_retains_baseline_and_failed_candidate(pilot,
     baseline_build = next(row for row in result.execution['baseline']['checks'] if row['kind'] == 'build')
     assert 'compiler warning' in Path(baseline_build['log_file']).read_text()
     check = next(row for row in result.execution['checks'] if row['kind'] == 'build')
-    assert check['phase'] == 'post-change'
+    assert check['phase'] == 'repair-3'
+    assert result.execution['coding_attempts'] == 4
+    assert result.execution['status'] == 'EXHAUSTED'
     assert check['exit_code'] == 9 and check['status'] == 'FAIL'
     assert check['content_identity'] == result.execution['product_change']['identity']
     assert 'argument with spaces' in Path(check['log_file']).read_text()

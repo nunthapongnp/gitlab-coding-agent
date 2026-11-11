@@ -1,7 +1,6 @@
 """Fresh independent review and evidence bound to the complete Product Change."""
 from __future__ import annotations
 
-from dataclasses import replace
 import hashlib
 import json
 from pathlib import Path
@@ -19,21 +18,24 @@ def workspace_identity(context):
 
 def assert_review_current(context, candidate, services):
     """Publication/repair callers must recheck the approval immediately before use."""
+    context.remaining(services.clock)
     review = candidate.get('review', {})
     if (review.get('status') != 'PASS'
             or review.get('content_identity') != candidate['product_change']['identity']
             or review.get('workspace_identity') != workspace_identity(context)):
         raise ValueError('Independent review approval is missing or stale for the current content')
+    context.remaining(services.clock)
 
 
 def _current_candidate(context, candidate, settings, services):
     command = services.command_runner or context.runtime.run_command
-    def git(*args):
-        remaining = context.deadline - services.clock()
+    def git(*args, binary=False):
+        remaining = context.remaining(services.clock)
         if remaining <= 0:
             raise ValueError('Execute Run deadline expired before review')
+        options = {'binary': True} if binary else {}
         return command(['git', *args], cwd=context.checkout, timeout=min(30, remaining),
-                       env=clean_environment())
+                       env=clean_environment(), **options)
     current = collect_candidate(context, git, excluded_paths=candidate.get('generated_files', []),
                                 secrets=(settings.gitlab_token, settings.llm_api_key))
     ignored = {'identity', 'initial_history_identity', 'observed_history_identity'}
@@ -142,28 +144,44 @@ def review_issue(context, candidate, settings, services):
             approved_plan=context.agreement, plan_comment_id=context.plan_comment_id,
             product_change=candidate['product_change'], verification=verification, verification_logs=logs)
         payload = redact(payload, settings)
-        (context.artifacts / 'review-input.json').write_text(json.dumps(payload, indent=2), encoding='utf-8')
-        before = workspace_identity(context)
-        remaining = context.deadline - services.clock()
-        if remaining <= 0:
-            raise ValueError('Execute Run deadline expired before review')
-        response = None
-        role_error = None
-        try:
-            response = context.runtime.run_role(role='reviewer', workspace=context.workspace,
-                prompt=json.dumps(redact(payload, settings)),
-                settings=replace(settings, timeout_seconds=min(settings.timeout_seconds, remaining)))
-        except Exception as exc:
-            role_error = exc
-        (context.artifacts / 'review-response.json').write_text(
-            json.dumps(redact(response, settings), indent=2), encoding='utf-8')
-        after = workspace_identity(context)
-        review.update(before_workspace_identity=before, after_workspace_identity=after)
-        if before != after:
-            raise ValueError('Reviewer mutated source, index or history; approval rejected')
-        if role_error:
-            raise ValueError('Reviewer did not finish with a structured result')
-        review.update(_validate(response, context, candidate), workspace_identity=after)
+        input_text = json.dumps(payload, indent=2)
+        (context.artifacts / 'review-input.json').write_text(input_text, encoding='utf-8')
+        (context.artifacts / f'review-input-{candidate["product_change"]["identity"]}.json').write_text(
+            input_text, encoding='utf-8')
+        review['format_corrections'] = 0
+        for correction in range(2):
+            before = workspace_identity(context)
+            context.remaining(services.clock)
+            response = None
+            role_error = None
+            try:
+                response = context.runtime.run_role(role='reviewer', workspace=context.workspace,
+                    prompt=json.dumps(redact(payload, settings)), settings=settings)
+            except Exception as exc:
+                role_error = exc
+            response_text = json.dumps(redact(response, settings), indent=2)
+            (context.artifacts / 'review-response.json').write_text(response_text, encoding='utf-8')
+            (context.artifacts / f'review-response-{candidate["product_change"]["identity"]}-{correction}.json').write_text(
+                response_text, encoding='utf-8')
+            after = workspace_identity(context)
+            review.update(before_workspace_identity=before, after_workspace_identity=after)
+            if before != after:
+                raise ValueError('Reviewer mutated source, index or history; approval rejected')
+            context.remaining(services.clock)
+            if role_error:
+                raise ValueError('Reviewer did not finish with a structured result')
+            try:
+                decision = _validate(response, context, candidate)
+            except ValueError as exc:
+                if correction:
+                    raise
+                review['format_corrections'] += 1
+                payload['output_format_correction'] = dict(reason=str(exc), previous_output=response,
+                    instruction='Return one complete valid structured decision for this unchanged content. '
+                    'No coding repair has occurred; never treat malformed approval as approval.')
+                continue
+            review.update(decision, workspace_identity=after)
+            break
     except Exception as exc:
         review.update(status='BLOCKED', reason=str(exc) if isinstance(exc, ValueError) else
                       'Review runtime or evidence collection failed; approval is withheld.')

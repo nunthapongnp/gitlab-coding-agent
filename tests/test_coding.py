@@ -188,6 +188,9 @@ def test_explicit_dependency_scope_allows_configuration_without_exhaustive_file_
     transport.notes[0]['body'] = render_plan_comment(agreement)
 
     def coder(**context):
+        if json.loads(context['prompt'])['role'] == 'reviewer':
+            from test_review import approval
+            return approval(json.loads(context['prompt']))
         context['tools'].call('write', 'frontend/package.json',
             content='{"scripts":{"build":"ng build"},"dependencies":{"task-ids":"1.0.0"}}',
             reason='Approved task ID dependency', acceptance_ids=['A1'], approval_reference=reference)
@@ -208,6 +211,9 @@ def test_implement_returns_complete_local_candidate_preserving_human_history(app
     calls = []
 
     def coder(**context):
+        if json.loads(context['prompt'])['role'] == 'reviewer':
+            from test_review import approval
+            return approval(json.loads(context['prompt']))
         calls.append(context)
         agreement = json.loads(context['prompt'])
         assert agreement['approved_plan']['requirement'] == 'Show task IDs'
@@ -284,7 +290,13 @@ def test_coder_sdk_offers_scoped_tools_and_keeps_conversation_only_within_run(ap
     proxy = ThreadingHTTPServer(('127.0.0.1', 0), Proxy)
     thread = threading.Thread(target=proxy.serve_forever, daemon=True)
     thread.start()
-    runtime = LocalRuntime()
+    class Runtime(LocalRuntime):
+        def run_role(self, *, role, prompt, **kwargs):
+            if role == 'reviewer':
+                from test_review import approval
+                return approval(json.loads(prompt))
+            return super().run_role(role=role, prompt=prompt, **kwargs)
+    runtime = Runtime()
     app.settings = replace(app.settings, llm_base_url=f'http://127.0.0.1:{proxy.server_port}/v1', timeout_seconds=60)
     app.services = replace(app.services, role_runtime=runtime)
     try:

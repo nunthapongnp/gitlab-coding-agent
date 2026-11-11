@@ -27,8 +27,8 @@ def clean_environment():
 @dataclass(frozen=True)
 class CommandResult:
     argv: list[str]
-    stdout: str
-    stderr: str
+    stdout: str | bytes
+    stderr: str | bytes
     exit_code: int | None
     duration_seconds: float
     reason: str = ''
@@ -84,13 +84,26 @@ class LocalRuntime:
         self.model_runner = model_runner
         self.active = None
         self.coding_sessions = {}
+        self.deadline = None
+        self.clock = time.monotonic
 
-    def run_command(self, argv, *, cwd, timeout, env=None):
+    def bind_deadline(self, deadline, clock=time.monotonic):
+        self.deadline, self.clock = deadline, clock
+
+    def remaining(self, limit=None):
+        remaining = float('inf') if self.deadline is None else self.deadline - self.clock()
+        if remaining <= 0:
+            self.cancel()
+            raise TimeoutError('Execute Run deadline expired')
+        return min(limit, remaining) if limit is not None else remaining
+
+    def run_command(self, argv, *, cwd, timeout, env=None, binary=False):
         """Keep stdout compatibility for Git and role callers."""
-        return self.run_command_result(argv, cwd=cwd, timeout=timeout, env=env).stdout
+        return self.run_command_result(argv, cwd=cwd, timeout=timeout, env=env, binary=binary).stdout
 
-    def run_command_result(self, argv, *, cwd, timeout, env=None):
+    def run_command_result(self, argv, *, cwd, timeout, env=None, binary=False):
         """Retain actual argv, both streams and timing through one cancellation owner."""
+        timeout = self.remaining(timeout)
         started = time.monotonic()
         argv = list(argv)
         launch = argv
@@ -105,10 +118,10 @@ class LocalRuntime:
             launch = subprocess.list2cmdline(argv[:4]) + ' ' + argv[4]
         self.active = subprocess.Popen(launch, cwd=cwd, env=env or clean_environment(),
                                        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                       stderr=subprocess.PIPE, text=True,
+                                       stderr=subprocess.PIPE, text=not binary,
                                        start_new_session=os.name != 'nt')
         try:
-            stdout, stderr = self.active.communicate(timeout=timeout)
+            stdout, stderr = self.active.communicate(timeout=self.remaining(timeout))
             if self.active.returncode:
                 raise CommandExecutionError(CommandResult(list(argv), stdout, stderr,
                     self.active.returncode, time.monotonic() - started))
@@ -124,8 +137,26 @@ class LocalRuntime:
         if self.active is not None and self.active.poll() is None:
             if os.name == 'nt':
                 subprocess.run(['taskkill', '/PID', str(self.active.pid), '/T', '/F'],
-                               capture_output=True, check=False)
+                               capture_output=True, check=False, timeout=5)
+                if self.active.poll() is None:
+                    self.active.kill()
             else:
+                # Coder commands may create their own process groups. Snapshot
+                # descendants before killing their worker so none are orphaned.
+                listing = subprocess.run(['ps', '-eo', 'pid=,ppid='], capture_output=True,
+                                         text=True, check=True, timeout=5).stdout
+                relationships = [tuple(map(int, row.split())) for row in listing.splitlines()]
+                descendants = {self.active.pid}
+                while True:
+                    children = {pid for pid, parent in relationships if parent in descendants}
+                    if children <= descendants:
+                        break
+                    descendants.update(children)
+                for pid in descendants - {self.active.pid}:
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
                 os.killpg(self.active.pid, signal.SIGKILL)
             return self.active.communicate()
 
@@ -152,11 +183,11 @@ class LocalRuntime:
         def timeout(limit):
             remaining = limit if deadline is None else min(limit, deadline - clock())
             if remaining <= 0:
-                raise RuntimeError('Execute Run deadline expired')
+                raise TimeoutError('Execute Run deadline expired')
             return remaining
         command(['git', '-c', 'core.hooksPath=' + str(artifacts / 'disabled-hooks'),
                  'clone', '--no-hardlinks', '--branch', branch, '--', url, str(checkout)],
-                cwd=root, timeout=timeout(settings.timeout_seconds),
+                cwd=root, timeout=timeout(settings.execution_max_runtime_seconds),
                 env=_git_auth_env(settings.gitlab_token, settings.gitlab_git_username))
         commit = command(['git', 'rev-parse', 'HEAD'], cwd=checkout,
                          timeout=timeout(30), env=clean_environment()).strip()
@@ -168,19 +199,26 @@ class LocalRuntime:
                 for path in workspace.checkout.rglob('*') if path.is_file()}
 
     def run_role(self, *, role, workspace, prompt, settings):
+        role_budget = self.remaining(settings.execution_max_runtime_seconds)
+        request_timeout = int(self.remaining(settings.timeout_seconds))
+        if request_timeout < 1:
+            raise TimeoutError('Insufficient remaining budget for a bounded model request')
         if role == 'coder':
-            return self._run_coder(workspace, prompt, settings)
+            return self._run_coder(workspace, prompt, settings, role_budget)
         if role not in {'planner', 'reviewer'}:
             raise ValueError('Role is not enabled')
         model = settings.llm_model
         options = {'model': model if model.startswith('openai/') else 'openai/' + model,
                    'base_url': settings.llm_base_url.rstrip('/'), 'api_key': settings.llm_api_key,
-                   'timeout': settings.timeout_seconds, 'num_retries': 0}
+                   'timeout': request_timeout, 'num_retries': 0}
         context = dict(context_id=uuid.uuid4().hex, tools=ReadOnlyTools(workspace.checkout),
                        workspace=workspace.checkout, artifacts=workspace.artifacts,
-                       prompt=prompt, model_options=options, max_iterations=settings.max_iterations)
+                       prompt=prompt, model_options=options, max_iterations=settings.max_iterations,
+                       deadline=time.monotonic() + role_budget)
         if self.model_runner:
-            return self.model_runner(**context)
+            result = self.model_runner(**context)
+            self.remaining()
+            return result
         payload = {key: str(value) if isinstance(value, Path) else value
                    for key, value in context.items() if key != 'tools'}
         # SDK discovery must not import user/project plugins, hooks, or MCP tools.
@@ -198,24 +236,25 @@ class LocalRuntime:
                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                                        start_new_session=os.name != 'nt')
         try:
-            stdout, stderr = self.active.communicate(json.dumps(payload), timeout=settings.timeout_seconds)
+            stdout, stderr = self.active.communicate(json.dumps(payload),
+                timeout=self.remaining(role_budget))
             if self.active.returncode:
                 raise RuntimeError(role.capitalize() + ' SDK execution failed')
             return json.loads(stdout)
         except subprocess.TimeoutExpired:
             self.cancel()
-            raise RuntimeError(role.capitalize() + ' timed out') from None
+            raise TimeoutError(role.capitalize() + ' role deadline expired') from None
         finally:
             self.active = None
 
-    def _run_coder(self, workspace, prompt, settings):
+    def _run_coder(self, workspace, prompt, settings, role_budget):
         from .coding import CodingTools
 
         agreement = json.loads(prompt)
         session = self.coding_sessions.get(workspace.run_id)
         if session is None:
             tools = CodingTools(workspace.checkout, agreement=agreement['approved_plan'],
-                                issue=agreement['issue'], runtime=self, timeout=settings.timeout_seconds)
+                                issue=agreement['issue'], runtime=self, timeout=settings.check_timeout_seconds)
             model = settings.llm_model
             session = dict(context_id=uuid.uuid4().hex, workspace=workspace.checkout,
                 artifacts=workspace.artifacts, tools=tools, state={}, max_iterations=settings.max_iterations,
@@ -225,15 +264,17 @@ class LocalRuntime:
             self.coding_sessions[workspace.run_id] = session
         if session['workspace'] != workspace.checkout:
             raise ValueError('Coding conversation belongs to another workspace')
+        session['model_options']['timeout'] = int(self.remaining(settings.timeout_seconds))
         if self.model_runner:
             response = self.model_runner(**session, prompt=prompt)
+            self.remaining()
             if isinstance(response, dict):
                 response = {**response, 'changes': list(session['tools'].changes.values()),
                             'commands': session['tools'].commands, 'tool_blockers': session['tools'].blockers}
             return response
-        return self._coder_worker(session, prompt, settings)
+        return self._coder_worker(session, prompt, settings, role_budget)
 
-    def _coder_worker(self, session, prompt, settings):
+    def _coder_worker(self, session, prompt, settings, role_budget):
         if 'process' not in session:
             role_home = session['artifacts'] / ('coder-home-' + session['context_id'])
             role_home.mkdir()
@@ -255,19 +296,26 @@ class LocalRuntime:
         try:
             payload = {key: str(value) if isinstance(value, Path) else value for key, value in session.items()
                        if key in {'context_id', 'workspace', 'artifacts', 'model_options', 'max_iterations'}}
-            payload.update(prompt=prompt, agreement=session['tools'].agreement, issue=session['tools'].issue)
+            payload.update(prompt=prompt, agreement=session['tools'].agreement, issue=session['tools'].issue,
+                           command_timeout=settings.check_timeout_seconds)
+            # Translate injected coordinator clocks into a process-local monotonic
+            # envelope; do not compare a test clock's epoch with the worker's clock.
+            payload['deadline'] = time.monotonic() + self.remaining(role_budget)
             self.active.stdin.write(json.dumps(payload) + '\n')
             self.active.stdin.flush()
-            line = session['lines'].get(timeout=settings.timeout_seconds)
+            line = session['lines'].get(timeout=self.remaining(role_budget))
             if line is None:
                 raise RuntimeError('Coder worker exited before structured output')
             message = json.loads(line)
             if 'error' in message:
                 raise RuntimeError('Coder SDK execution failed')
             return message['result']
-        except (queue.Empty, BrokenPipeError):
+        except queue.Empty:
             self.cancel()
-            raise RuntimeError('Coder timed out or exited') from None
+            raise TimeoutError('Coder role deadline expired') from None
+        except BrokenPipeError:
+            self.cancel()
+            raise RuntimeError('Coder worker exited before structured output') from None
         finally:
             self.active = None
 

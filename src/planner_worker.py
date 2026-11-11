@@ -5,6 +5,7 @@ import contextlib
 import json
 from pathlib import Path
 import sys
+import time
 from typing import Literal
 
 from .runtime import ReadOnlyTools
@@ -50,16 +51,28 @@ def run_sdk(context, *, sdk=None):
 
     register_tool(InspectionTool.name, InspectionTool)
     llm = sdk.LLM(**context['model_options'])
+    def clip_request(_event=None):
+        remaining = (context['deadline'] - time.monotonic()) if context.get('deadline') is not None else float('inf')
+        if remaining <= 0:
+            raise TimeoutError('Role deadline expired')
+        timeout = int(min(context['model_options']['timeout'], remaining))
+        if timeout < 1:
+            raise TimeoutError('Insufficient remaining budget for a bounded model request')
+        llm.timeout = timeout
     agent = sdk.Agent(llm=llm, tools=[sdk.Tool(name=InspectionTool.name)])
     # SDK events and conversations may contain repository secrets. Keep persistence
     # in memory; the coordinator retains only redacted structured observations.
     sdk_workspace = Path(context['artifacts']) / 'sdk-workspace'
     sdk_workspace.mkdir(exist_ok=True)
     conversation = sdk.Conversation(agent=agent, workspace=str(sdk_workspace),
-                                    max_iteration_per_run=context['max_iterations'])
+                                    max_iteration_per_run=context['max_iterations'], callbacks=[clip_request])
     try:
+        clip_request()
         conversation.send_message(context['prompt'])
         conversation.run()
+        status = conversation.state.execution_status
+        if getattr(status, 'value', status) != 'finished':
+            raise ValueError('Read-only role did not finish; submitted observations cannot authorize approval')
     finally:
         conversation.close()
     if not result:

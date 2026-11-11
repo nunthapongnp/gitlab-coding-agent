@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import time
 from typing import Literal
 
 from .coding import CodingTools
@@ -18,9 +19,14 @@ class CoderSession:
         from openhands.sdk.tool import Action, Observation, ToolDefinition, ToolExecutor, register_tool
 
         self.result = {}
+        runtime = LocalRuntime()
+        if context.get('deadline') is not None:
+            runtime.bind_deadline(context['deadline'])
         tools = CodingTools(context['workspace'], agreement=context['agreement'], issue=context['issue'],
-                            runtime=LocalRuntime(), timeout=context['model_options']['timeout'])
+                            runtime=runtime, timeout=context['command_timeout'])
         self.tools = tools
+        self.deadline = context.get('deadline')
+        self.request_timeout = context['model_options']['timeout']
         result = self.result
 
         class CodingAction(Action):
@@ -64,16 +70,31 @@ class CoderSession:
                     action_type=CodingAction, observation_type=CodingObservation, executor=CodingExecutor())]
 
         register_tool(CodingTool.name, CodingTool)
-        agent = sdk.Agent(llm=sdk.LLM(**context['model_options']), tools=[sdk.Tool(name=CodingTool.name)])
+        self.llm = sdk.LLM(**context['model_options'])
+        agent = sdk.Agent(llm=self.llm, tools=[sdk.Tool(name=CodingTool.name)])
         workspace = Path(context['artifacts']) / 'coder-sdk-workspace'
         workspace.mkdir(exist_ok=True)
         self.conversation = sdk.Conversation(agent=agent, workspace=str(workspace),
-            max_iteration_per_run=context['max_iterations'])
+            max_iteration_per_run=context['max_iterations'], callbacks=[self.clip_request])
 
-    def run(self, prompt):
+    def clip_request(self, _event=None):
+        remaining = self.deadline - time.monotonic() if self.deadline is not None else float('inf')
+        if remaining <= 0:
+            raise TimeoutError('Coder deadline expired')
+        timeout = int(min(self.request_timeout, remaining))
+        if timeout < 1:
+            raise TimeoutError('Insufficient remaining budget for a bounded model request')
+        self.llm.timeout = timeout
+
+    def run(self, prompt, request_timeout):
+        self.request_timeout = request_timeout
+        self.clip_request()
         self.result.clear()
         self.conversation.send_message(prompt)
         self.conversation.run()
+        status = self.conversation.state.execution_status
+        if getattr(status, 'value', status) != 'finished':
+            raise ValueError('Coder did not finish; an earlier submit is incomplete')
         if not self.result:
             raise ValueError('Coder finished without structured output')
         return {**self.result, 'changes': list(self.tools.changes.values()), 'commands': self.tools.commands,
@@ -93,7 +114,7 @@ def main():
                 try:
                     if session is None:
                         session = CoderSession(context)
-                    message = {'result': session.run(context['prompt'])}
+                    message = {'result': session.run(context['prompt'], context['model_options']['timeout'])}
                 except Exception:
                     message = {'error': 'Coder SDK execution failed'}
             sys.stdout.write(json.dumps(message) + '\n')

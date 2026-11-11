@@ -61,6 +61,7 @@ class CodingTools(ReadOnlyTools):
     def call(self, operation, path='.', query='', *, content='', reason='', acceptance_ids=None,
              approval_reference='', argv=None):
         with self.lock:
+            self.runtime.remaining()
             if operation in ('list', 'read', 'search'):
                 return super().call(operation, path, query)
             if operation in ('write', 'delete'):
@@ -145,17 +146,18 @@ def explicit_coverage(path, reference, agreement, issue):
                                reference, re.IGNORECASE)))
 
 
-def code_issue(context, settings, services, *, excluded_paths=()):
+def code_issue(context, settings, services, *, excluded_paths=(), repair_evidence=None, attempt=1):
     """Only an accepted fresh RunContext grants coding access; never a delivery result."""
     runtime = context.runtime
     command = services.command_runner or runtime.run_command
 
-    def git(*args):
-        remaining = context.deadline - services.clock()
+    def git(*args, binary=False):
+        remaining = context.remaining(services.clock)
         if remaining <= 0:
             raise RuntimeError('Execute Run deadline expired')
+        options = {'binary': True} if binary else {}
         return command(['git', *args], cwd=context.checkout, timeout=min(30, remaining),
-                       env=clean_environment())
+                       env=clean_environment(), **options)
 
     def history_state():
         metadata = {}
@@ -195,6 +197,10 @@ def code_issue(context, settings, services, *, excluded_paths=()):
             'Return {summary: string, blockers: string[]} through submit. Completion remains unverified.',
             'issue': {key: context.issue.get(key) for key in ('title', 'description')},
             'approved_plan': context.agreement}
+        if repair_evidence is not None:
+            payload['repair_evidence'] = repair_evidence
+            payload['instruction'] += (' Repair the current working code using these authoritative check/review failures. '
+                'Retain this run context; requirements and scope remain the Approved Plan.')
         prompt = json.dumps(redact(payload, settings))
         role_error = None
         try:
@@ -241,9 +247,11 @@ def code_issue(context, settings, services, *, excluded_paths=()):
         # Adapter exception strings may contain credentials, commands or arbitrary model output.
         message = str(exc) if isinstance(exc, ValueError) else 'Coding runtime or local command failed; inspect environment and run diagnostics.'
         result.update(status='BLOCKED', blockers=[message])
+        result['errors'] = [dict(phase='coding', error_type=type(exc).__name__)]
     result = redact(result, settings)
     serialized = json.dumps(result, indent=2)
     (context.artifacts / 'coding-result.json').write_text(serialized, encoding='utf-8')
+    (context.artifacts / f'coding-attempt-{attempt}.json').write_text(serialized, encoding='utf-8')
     return result
 
 
@@ -257,15 +265,12 @@ def collect_candidate(context, git, *, secrets=(), excluded_paths=()):
         if target.is_symlink() or (target.exists() and not target.resolve().is_relative_to(context.checkout.resolve())):
             raise ValueError('Candidate path escapes the source tree')
         # Git's binary output is read without text conversion for exact content identities.
-        import subprocess
-        baseline = subprocess.run(['git', 'ls-tree', '-z', context.initial_source_commit, '--', path],
-                                  cwd=context.checkout, env=clean_environment(), capture_output=True, check=True).stdout
+        baseline = git('ls-tree', '-z', context.initial_source_commit, '--', path, binary=True)
         before = None
         before_mode = None
         if baseline:
             header = baseline.split(b'\t', 1)[0].decode().split()
-            data = subprocess.check_output(['git', 'cat-file', 'blob', header[2]], cwd=context.checkout,
-                                           env=clean_environment())
+            data = git('cat-file', 'blob', header[2], binary=True)
             before_mode = header[0]
             before = content(data, before_mode)
         after_mode = before_mode if os.name == 'nt' and before_mode else (

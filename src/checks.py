@@ -180,7 +180,7 @@ def verify(context, selection, settings, services, *, phase, identity=None):
         try:
             if not cwd.is_relative_to(context.checkout.resolve()):
                 raise ValueError('Verification cwd escapes checkout')
-            remaining = context.deadline - services.clock()
+            remaining = context.remaining(services.clock)
             if remaining <= 0:
                 raise TimeoutError('Execute Run deadline expired')
             runner = services.command_runner or context.runtime.run_command_result

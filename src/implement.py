@@ -36,8 +36,21 @@ class RunContext:
     runtime: object = field(default=None, repr=False)
     gitlab: object = field(default=None, repr=False)
 
+    @property
+    def work_deadline(self):
+        # Keep normal report/label work inside the accepted run's deadline.
+        return self.deadline - min(30.0, (self.deadline - self.accepted_at) / 10)
+
+    def remaining(self, clock):
+        remaining = self.work_deadline - clock()
+        if remaining <= 0:
+            self.runtime.cancel()
+            raise TimeoutError('Execute Run work deadline expired; finalization budget reserved')
+        return remaining
+
     def metadata(self):
         return dict(run_id=self.run_id, accepted_at=self.accepted_at, deadline=self.deadline,
+                    work_deadline=self.work_deadline,
                     started_at=self.started_at, project_id=self.project['id'],
                     issue_iid=self.issue['iid'], mr_iid=self.mr['iid'],
                     plan_comment_id=self.plan_comment_id, source_branch=self.source_branch,
@@ -49,6 +62,7 @@ class RunPreparationError(RuntimeError):
     def __init__(self, context, message, *, cause=None):
         super().__init__(message)
         self.context = context
+        self.status = 'TIMEOUT' if isinstance(cause, TimeoutError) else 'BLOCKED'
         # This stays in memory until the finalizer redacts it for every output.
         self.failure = {'phase': 'preparation', 'error_type': type(cause).__name__,
                         'message': str(cause)} if cause is not None else None
@@ -119,23 +133,25 @@ def prepare_run(request, settings, services):
                          source, target, root / 'artifacts', root / 'checkout',
                          runtime=services.role_runtime or LocalRuntime(), gitlab=gitlab)
     try:
+        context.runtime.bind_deadline(context.work_deadline, services.clock)
         context.artifacts.mkdir(parents=True)
         (context.artifacts / 'run-context.json').write_text(json.dumps(context.metadata(), indent=2), encoding='utf-8')
         gitlab.replace_merge_request_status(project['id'], request.mr_iid,
-                                            'agent::implement', 'agent::in-progress')
+                                            'agent::implement', 'agent::in-progress',
+                                            deadline=context.work_deadline, clock=services.clock)
         context.workspace = context.runtime.prepare_workspace(project, settings,
             command_runner=services.command_runner, branch=source, run_id=run_id, root=root,
-            deadline=context.deadline, clock=services.clock)
+            deadline=context.work_deadline, clock=services.clock)
         context.initial_source_commit = context.workspace.commit
         command = services.command_runner or context.runtime.run_command
-        remaining = context.deadline - services.clock()
+        remaining = context.remaining(services.clock)
         if remaining <= 0:
             raise RuntimeError('Execute Run deadline expired')
         clean = command(['git', 'status', '--porcelain', '--untracked-files=all'],
                         cwd=context.checkout, timeout=min(30, remaining), env=clean_environment())
         if clean.strip():
             raise RuntimeError('Fresh source checkout is not clean')
-        remaining = context.deadline - services.clock()
+        remaining = context.remaining(services.clock)
         if remaining <= 0:
             raise RuntimeError('Execute Run deadline expired')
         branch = command(['git', 'symbolic-ref', '--short', 'HEAD'], cwd=context.checkout,

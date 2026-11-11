@@ -246,10 +246,11 @@ def test_application_constructs_sdk_with_only_readonly_tool_and_structured_submi
             self.tools = tools
 
     class Conversation:
-        def __init__(self, *, agent, workspace, max_iteration_per_run):
+        def __init__(self, *, agent, workspace, max_iteration_per_run, callbacks):
             assert Path(workspace).name == 'sdk-workspace'
             assert Path(workspace).parent.name == 'artifacts'
             self.tool_name = agent.tools[0].name
+            self.state = SimpleNamespace(execution_status='finished')
 
         def send_message(self, prompt):
             assert json.loads(prompt)['role'] == 'planner'

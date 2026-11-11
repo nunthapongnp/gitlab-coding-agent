@@ -184,7 +184,8 @@ def test_findings_reference_unrelated_change_and_return_actionable_repair_input(
 def test_failed_required_validation_cannot_be_overridden_by_reviewer_prose(reviewed_application):
     invoke, roles = reviewed_application
     result = invoke(build_failure=True)
-    assert [role[0] for role in roles] == ['coder']
+    assert [role[0] for role in roles] == ['coder'] * 4
+    assert result.execution['status'] == 'EXHAUSTED'
     assert result.execution['product_verification']['status'] == 'FAIL'
     assert result.execution['review']['status'] == 'NOT_RUN'
     assert result.execution['push']['status'] == 'NOT_ATTEMPTED'
