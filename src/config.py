@@ -83,5 +83,7 @@ class Settings:
             test_command=(environ.get("TEST_COMMAND") or "").strip() or None,
             git_author_name=environ.get("GIT_AUTHOR_NAME", "agent-bot"),
             git_author_email=environ.get("GIT_AUTHOR_EMAIL", "ai@agent.bot"),
-            output_dir=output_dir or Path("runs"),
+            output_dir=output_dir or (Path(os.environ.get('LOCALAPPDATA') or
+                os.environ.get('XDG_STATE_HOME') or Path.home() / '.local' / 'state') /
+                'gitlab-coding-agent' / 'runs'),
         )

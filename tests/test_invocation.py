@@ -33,7 +33,7 @@ def test_invalid_invocation_stops_before_startup(args):
     assert "LLM_BASE_URL" not in output.getvalue()
 
 
-@pytest.mark.parametrize("operation,mr_iid", [("explore", None), ("implement", 12)])
+@pytest.mark.parametrize("operation,mr_iid", [("implement", 12)])
 def test_valid_incomplete_operations_refuse_all_external_effects(operation, mr_iid, tmp_path):
     from src.config import Settings
     from src.workflow import Application, ApplicationServices, OperationInput, OutcomeStatus

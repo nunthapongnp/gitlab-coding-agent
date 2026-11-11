@@ -28,6 +28,9 @@ class OutcomeStatus(str, Enum):
 class OperationOutcome:
     status: OutcomeStatus
     message: str
+    inspection: dict | None = None
+    workspace: Path | None = None
+    diagnostics: Path | None = None
 
     @property
     def succeeded(self) -> bool:
@@ -97,6 +100,20 @@ class Application:
             settings.validate()
         except ConfigurationError as exc:
             return OperationOutcome(OutcomeStatus.CONFIGURATION_ERROR, str(exc))
+        if request.operation == 'explore':
+            from .explore import InspectionError, inspect
+            try:
+                workspace, inspection = inspect(request, settings, self.services)
+                return OperationOutcome(OutcomeStatus.UNAVAILABLE,
+                    'Read-only inspection complete; plan review/publication is not enabled. No executable plan published.',
+                    inspection, workspace.checkout, workspace.artifacts)
+            except InspectionError as exc:
+                return OperationOutcome(OutcomeStatus.FAILED, str(exc),
+                    workspace=exc.workspace.checkout, diagnostics=exc.workspace.artifacts)
+            except ValueError as exc:
+                return OperationOutcome(OutcomeStatus.FAILED, str(exc))
+            except Exception:
+                return OperationOutcome(OutcomeStatus.FAILED, 'Explore failed; no executable plan published.')
         return OperationOutcome(OutcomeStatus.UNAVAILABLE,
                                 f"The {request.operation} operation is not enabled yet; "
                                 "install the remaining Phase 0 workflow capabilities before retrying.")

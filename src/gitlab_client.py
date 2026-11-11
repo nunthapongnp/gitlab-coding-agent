@@ -69,6 +69,21 @@ class GitLabClient:
             raise GitLabAPIError("GitLab returned an unexpected issue response")
         return payload
 
+    def get_issue_notes(self, project: str | int, issue_iid: int) -> list[dict]:
+        """Read the complete discussion, including pages beyond the first 100."""
+        notes = []
+        page = 1
+        while True:
+            payload = self._request('GET',
+                f'projects/{self._project_path(project)}/issues/{issue_iid}/notes',
+                params={'page': page, 'per_page': 100, 'order_by': 'id', 'sort': 'asc'})
+            if not isinstance(payload, list):
+                raise GitLabAPIError('GitLab returned an unexpected Issue comment list')
+            if not payload:
+                return notes
+            notes.extend(payload)
+            page += 1
+
     def find_open_merge_request(
         self, project: str | int, source_branch: str, target_branch: str
     ) -> dict | None:

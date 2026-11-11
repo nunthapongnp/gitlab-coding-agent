@@ -40,7 +40,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         if operation == "implement":
             command.add_argument("--mr", required=True, type=positive_iid, help="Existing user-created MR IID")
         command.add_argument("--gitlab-url", help="Override GITLAB_URL")
-        command.add_argument("--output-dir", type=Path, default=Path("runs"))
+        command.add_argument("--output-dir", type=Path,
+                             help="Run storage outside Git checkouts (default: user state directory)")
     return parser.parse_args(argv)
 
 
@@ -71,6 +72,8 @@ def main(
     stream = stdout if outcome.succeeded else stderr
     prefix = "" if outcome.succeeded else "ERROR "
     print(f"{prefix}{outcome.status.value}: {outcome.message}", file=stream)
+    if outcome.diagnostics:
+        print(f"Diagnostics: {outcome.diagnostics}", file=stream)
     return outcome.exit_code
 
 
