@@ -1,6 +1,7 @@
 import copy
 import json
 import shutil
+import sys
 from urllib.parse import unquote, urlsplit
 
 import pytest
@@ -84,6 +85,15 @@ def approved(source, tmp_path):
     assert explored.succeeded, explored.message
     shutil.rmtree(explored.workspace.parent)
     transport.issue['labels'] = ['team', 'agent::approved']
+    # These tiny coding/preflight fixtures have no Angular/Java toolchain. The
+    # agreed command seam validates their local deliverables with real children.
+    from src.agreement import parse_plan_comment, render_plan_comment
+    agreement = parse_plan_comment(transport.notes[0]['body'])
+    agreement['commands'] = [dict(module=module, cwd=module,
+        argv=[sys.executable, '-c', f'from pathlib import Path; assert Path("{manifest}").is_file(); print("fixture build validation")'],
+        evidence='Controlled fixture module validation at the approved command boundary')
+        for module, manifest in [('frontend', 'package.json'), ('backend', 'pom.xml')]]
+    transport.notes[0]['body'] = render_plan_comment(agreement)
     transport.calls.clear()
     git(source, 'checkout', '-b', 'human/task-2')
     (source / 'human.txt').write_text('Existing human work')

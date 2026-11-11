@@ -1,259 +1,227 @@
+"""Evidence-backed module verification for accepted Execute Runs."""
 from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 import re
 import shlex
-import subprocess
 import sys
-import time
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any
+
+from .coding import redact
+from .runtime import CommandExecutionError, CommandResult, clean_environment
 
 
-@dataclass(frozen=True)
-class CheckCommand:
-    name: str
-    command: str
+IGNORED = {'.git', 'node_modules', 'target', 'dist', 'build', '.venv', 'venv', '__pycache__'}
 
 
-def _python_executable(repo_dir: Path) -> str:
-    candidates = [
-        repo_dir / ".venv" / "bin" / "python",
-        repo_dir / "venv" / "bin" / "python",
-        repo_dir / ".venv" / "Scripts" / "python.exe",
-        repo_dir / "venv" / "Scripts" / "python.exe",
-    ]
-    for candidate in candidates:
-        if candidate.is_file():
-            return str(candidate)
-    return sys.executable
+def source_files(root):
+    for current, directories, names in os.walk(root, followlinks=False):
+        directories[:] = sorted(name for name in directories if name not in IGNORED
+                                and not (Path(current) / name).is_symlink())
+        for name in sorted(names):
+            path = Path(current) / name
+            if not path.is_symlink():
+                yield path
 
 
-def _node_package_manager(repo_dir: Path) -> str:
-    if (repo_dir / "pnpm-lock.yaml").exists():
-        return "pnpm"
-    if (repo_dir / "yarn.lock").exists():
-        return "yarn"
-    return "npm"
+def command_kind(argv, evidence=''):
+    text = ' '.join(Path(arg).name if ('/' in arg or '\\' in arg) else arg for arg in argv) + ' ' + evidence
+    if re.search(r'\b(?:test|tests|pytest)\b|\.spec\.', text, re.I):
+        return 'test'
+    if re.search(r'\b(?:install|ci)\b', ' '.join(argv[1:]), re.I):
+        return 'setup'
+    if re.search(r'\b(?:build|compile|package|assemble|verify|validate|validation|check)\b', text, re.I):
+        return 'build'
+    return None
 
 
-def detect_check_commands(
-    repo_dir: Path,
-    *,
-    build_command: str | None = None,
-    test_command: str | None = None,
-) -> dict[str, str | None]:
-    repo_dir = repo_dir.resolve()
-    detected_build: str | None = None
-    detected_test: str | None = None
+def discover(context):
+    """Small pilot discovery: precedence is applied independently per module/check."""
+    root = context.checkout
+    files = list(source_files(root))
+    manifests = [p for p in files if p.name in {'package.json', 'pom.xml'}]
+    all_modules = {p.parent.relative_to(root).as_posix(): p.name for p in manifests}
+    modules = {}
+    for scope in context.agreement['scope']:
+        matches = [name for name, manifest in all_modules.items() if name == scope
+            or (manifest == 'package.json' and re.search(r'frontend|angular|client|web', scope, re.I))
+            or (manifest == 'pom.xml' and re.search(r'backend|spring|server|api', scope, re.I))]
+        if not matches:
+            matches = [scope if (root / scope).is_dir() else '.']
+        for name in matches:
+            modules.setdefault(name, scope)
+    checks = []
+    for module, scope in modules.items():
+        directory = root / module
+        selected = {}
+        considered = []
+        def offer(argv, cwd, evidence, source):
+            kind = command_kind(argv, evidence if source == 'Approved Plan' else '')
+            if kind and kind not in selected:
+                selected[kind] = dict(argv=argv, cwd=cwd, module=module, scope=scope,
+                    kind=kind, evidence=evidence, source=source, executed=False)
+        for command in context.agreement['commands']:
+            if command['module'] == scope:
+                offer(command['argv'], command['cwd'], command['evidence'], 'Approved Plan')
+        considered.append('Approved Plan: no workable command for any remaining check kind.')
+        for guidance in [p for p in files if p.name.lower().startswith(('readme', 'agents', 'contributing', 'claude'))
+                         and p.parent in {root, directory}]:
+            text = guidance.read_text(encoding='utf-8', errors='replace')
+            cwd = guidance.parent.relative_to(root).as_posix()
+            for line in text.splitlines():
+                line = line.strip().strip('`').removeprefix('$ ')
+                if line.startswith('cd '):
+                    cwd = line[3:].strip().strip('"\'')
+                    continue
+                if any(token in line for token in ('&&', '||', ';', '|', '>')):
+                    continue
+                try:
+                    argv = shlex.split(line, posix=True)
+                except ValueError:
+                    continue
+                if argv and (Path(argv[0]).stem.lower() in {'npm', 'pnpm', 'yarn', 'mvn', 'mvnw',
+                            'python', 'python3', 'make'} or argv[0] == sys.executable):
+                    # Root guidance must identify the module through cd or an explicit path.
+                    if cwd == module:
+                        offer(argv, cwd, guidance.relative_to(root).as_posix(), 'repository guidance')
+        considered.append('Repository guidance: no workable command for any remaining check kind.')
+        package = directory / 'package.json'
+        if package.is_file():
+            try:
+                scripts = json.loads(package.read_text(encoding='utf-8')).get('scripts', {})
+                manager = 'pnpm' if (directory / 'pnpm-lock.yaml').is_file() else (
+                    'yarn' if (directory / 'yarn.lock').is_file() else 'npm')
+                for name in ('build', 'test'):
+                    if name in scripts:
+                        argv = [manager, 'run', name]
+                        expected = json.dumps(context.agreement['verification'])
+                        if name == 'build' and re.search(r'\bproduction\b', expected, re.I) and 'ng build' in scripts[name] and not re.search(r'--prod|--configuration[= ]+production', scripts[name]):
+                            argv += ['--', '--configuration', 'production']
+                        offer(argv, module, package.relative_to(root).as_posix(), 'Node package manifest')
+            except (ValueError, AttributeError):
+                considered.append('Node package manifest is malformed.')
+        considered.append('Node package manifest: no workable command for any remaining check kind.')
+        pom = directory / 'pom.xml'
+        if pom.is_file():
+            wrapper = directory / ('mvnw.cmd' if os.name == 'nt' else 'mvnw')
+            executable = str(wrapper.resolve()) if wrapper.is_file() else 'mvn'
+            offer([executable, '-B', '-DskipTests', 'package'], module,
+                  pom.relative_to(root).as_posix(), 'Maven descriptor')
+            offer([executable, '-B', 'test'], module,
+                  pom.relative_to(root).as_posix(), 'Maven descriptor')
+        considered.append('Maven descriptor: no workable command for any remaining check kind.')
+        for script in sorted((directory / 'scripts').glob('*')) if (directory / 'scripts').is_dir() else []:
+            if script.suffix == '.py' and script.stem in {'build', 'test', 'validate', 'check'}:
+                offer([sys.executable, str(script.resolve())], module,
+                      script.relative_to(root).as_posix(), 'scripts/Make/configuration')
+        makefile = directory / 'Makefile'
+        if makefile.is_file():
+            for target in re.findall(r'^(build|test|validate|check):', makefile.read_text(), re.M):
+                offer(['make', target], module, makefile.relative_to(root).as_posix(), 'scripts/Make/configuration')
+        considered.append('Scripts/Make/configuration: no workable command for any remaining check kind.')
+        ci = root / '.gitlab-ci.yml'
+        considered.append('GitLab CI: inspected as corroboration only; never execute pipeline/deployment jobs.'
+                          + f' {len(ci.read_text(encoding="utf-8", errors="replace").splitlines())} lines inspected.'
+                          if ci.is_file() else 'GitLab CI: absent.')
+        if (directory / 'angular.json').is_file():
+            offer(['ng', 'build'], module, 'angular.json identifies an Angular build target; earlier sources absent.',
+                  'repository analysis')
+        module_files = [p for p in files if p.is_relative_to(directory)]
+        case_candidates = [p for p in module_files if re.search(
+            r'(?:\.(?:spec|test)\.[cm]?[jt]sx?$|(?:Test|Tests)\.java$|(?:^|[/\\])test_[^/\\]+\.py$|_test\.py$)', str(p))
+            and p.stat().st_size > 0]
+        cases = [p.relative_to(root).as_posix() for p in case_candidates if re.search(
+            r'\b(?:it|test|specify)\s*\(|@(?:Test|ParameterizedTest|RepeatedTest)\b|\bdef\s+test_\w+\s*\(',
+            p.read_text(encoding='utf-8', errors='replace'))]
+        if not cases:
+            selected['test'] = dict(kind='test', module=module, scope=scope, argv=[], cwd=module,
+                source='test source inspection', evidence='No executable test declarations found in inspected module sources.',
+                reason='Configured runner has no test cases.' if 'test' in selected else 'No test cases or applicable suite found.',
+                status='SKIPPED', executed=False)
+        elif 'test' not in selected:
+            selected['test'] = dict(kind='test', module=module, scope=scope, argv=[], cwd=module,
+                source='test source inspection', evidence=cases, status='UNVERIFIED', executed=False,
+                reason='Existing test cases have no workable test command.')
+        if 'build' not in selected:
+            selected['build'] = dict(kind='build', module=module, scope=scope, argv=[], cwd=module,
+                source='repository analysis', evidence=considered, status='UNVERIFIED', executed=False,
+                reason='No meaningful mandatory build/validation could be established.')
+        for kind in ('setup', 'build', 'test'):
+            if kind in selected:
+                checks.append(dict(selected[kind], test_cases=cases, discovery_notes=considered))
+    return dict(checks=checks, modules=list(modules), exclusions=[dict(module=name,
+        reason='Outside approved affected modules; no dependency evidence selects it.')
+        for name in all_modules if name not in modules])
 
-    package_json = repo_dir / "package.json"
-    if package_json.is_file():
+
+def verify(context, selection, settings, services, *, phase, identity=None):
+    def output_inventory():
+        return {p.relative_to(context.checkout).as_posix() for current, dirs, names in
+            os.walk(context.checkout, followlinks=False)
+            for p in inventory_directory(current, dirs, names)}
+    before_files = output_inventory()
+    checks = []
+    for number, proposed in enumerate(selection['checks']):
+        check = dict(proposed, phase=phase, content_identity=identity,
+                     actual_argv=proposed['argv'],
+                     status='UNVERIFIED', exit_code=None, duration_seconds=0.0)
+        cwd = (context.checkout / proposed['cwd']).resolve()
+        check['cwd'] = str(cwd)
+        if proposed.get('status') in {'SKIPPED', 'UNVERIFIED'}:
+            check.update(status=proposed['status'], reason=proposed['reason'], log_file=None)
+            checks.append(check)
+            continue
+        log = context.artifacts / 'checks' / phase / '1' / proposed['module'] / f'{number}-{proposed["kind"]}.log'
+        log.parent.mkdir(parents=True, exist_ok=True)
+        check['log_file'] = str(log)
+        started = services.clock()
+        output = ''
         try:
-            scripts = (json.loads(package_json.read_text(encoding="utf-8")).get("scripts") or {})
-        except (OSError, json.JSONDecodeError, AttributeError):
-            scripts = {}
-        manager = _node_package_manager(repo_dir)
-        if "build" in scripts:
-            detected_build = f"{manager} run build"
-        if "test" in scripts:
-            detected_test = f"{manager} test"
-    elif (repo_dir / "go.mod").is_file():
-        detected_build, detected_test = "go build ./...", "go test ./..."
-    elif (repo_dir / "Cargo.toml").is_file():
-        detected_build, detected_test = "cargo check --all-targets", "cargo test"
-    elif (repo_dir / "pom.xml").is_file():
-        mvn = "./mvnw" if (repo_dir / "mvnw").exists() else "mvn"
-        detected_build, detected_test = f"{mvn} -B -DskipTests package", f"{mvn} -B test"
-    elif any(repo_dir.glob("*.gradle")) or any(repo_dir.glob("*.gradle.kts")) or (repo_dir / "gradlew").is_file():
-        gradle = "./gradlew" if (repo_dir / "gradlew").is_file() else "gradle"
-        detected_build, detected_test = f"{gradle} assemble", f"{gradle} test"
-    elif any(repo_dir.glob("*.sln")) or any(repo_dir.glob("*.csproj")):
-        detected_build, detected_test = "dotnet build", "dotnet test --no-build"
-    elif (repo_dir / "pyproject.toml").is_file() or (repo_dir / "setup.py").is_file() or (repo_dir / "requirements.txt").is_file():
-        python = shlex.quote(_python_executable(repo_dir))
-        exclude = r"(^|[\\/])(\.venv|venv|\.git|build|dist)([\\/]|$)"
-        detected_build = f"{python} -m compileall -q . -x {shlex.quote(exclude)}"
-        has_tests = (
-            (repo_dir / "tests").is_dir()
-            or (repo_dir / "test").is_dir()
-            or any(repo_dir.glob("test_*.py"))
-            or any(repo_dir.glob("*_test.py"))
-        )
-        if has_tests:
-            detected_test = f"{python} -m pytest -q"
-
-    makefile = repo_dir / "Makefile"
-    if makefile.is_file():
-        try:
-            targets = set(re.findall(r"(?m)^([A-Za-z0-9_.-]+)\s*:", makefile.read_text(encoding="utf-8", errors="replace")))
-            if detected_build is None and "build" in targets:
-                detected_build = "make build"
-            if detected_test is None and "test" in targets:
-                detected_test = "make test"
-        except OSError:
-            pass
-
-    return {
-        "build": build_command.strip() if build_command and build_command.strip() else detected_build,
-        "test": test_command.strip() if test_command and test_command.strip() else detected_test,
-    }
-
-
-def _run_one_check(
-    repo_dir: Path,
-    check: CheckCommand,
-    *,
-    timeout_seconds: int,
-    log_path: Path,
-) -> dict[str, Any]:
-    started = time.monotonic()
-    result: dict[str, Any] = {
-        "name": check.name,
-        "command": check.command,
-        "status": "failed",
-        "exit_code": None,
-        "duration_seconds": 0.0,
-        "log_file": str(log_path),
-        "output_excerpt": "",
-    }
-    try:
-        args = shlex.split(check.command, posix=(os.name != "nt"))
-        if not args:
-            raise ValueError("Command is empty")
-        env = os.environ.copy()
-        # Do not expose publication/model credentials to project-controlled scripts.
-        env.pop("GITLAB_TOKEN", None)
-        env.pop("LLM_API_KEY", None)
-        env.update({"CI": "true", "NONINTERACTIVE": "1", "PYTHONUNBUFFERED": "1"})
-        completed = subprocess.run(
-            args,
-            cwd=str(repo_dir),
-            env=env,
-            text=True,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=timeout_seconds,
-            check=False,
-        )
-        output = completed.stdout or ""
-        result["exit_code"] = completed.returncode
-        result["status"] = "passed" if completed.returncode == 0 else "failed"
-    except subprocess.TimeoutExpired as exc:
-        partial = exc.stdout or ""
-        if isinstance(partial, bytes):
-            partial = partial.decode("utf-8", errors="replace")
-        output = f"{partial}\n\nCHECK TIMED OUT after {timeout_seconds} seconds."
-        result["status"] = "timed_out"
-    except FileNotFoundError as exc:
-        output = f"Executable not found: {exc}. Check project toolchain/PATH or configure the command."
-        result["status"] = "command_not_found"
-    except (OSError, ValueError) as exc:
-        output = f"Could not execute check: {type(exc).__name__}: {exc}"
-        result["status"] = "failed_to_start"
-
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    log_path.write_text(output, encoding="utf-8", errors="replace")
-    result["duration_seconds"] = round(time.monotonic() - started, 2)
-    result["output_excerpt"] = output[-16000:]
-    return result
-
-
-def run_build_and_test(
-    repo_dir: Path,
-    run_dir: Path,
-    *,
-    setup_command: str | None = None,
-    build_command: str | None,
-    test_command: str | None,
-    timeout_seconds: int,
-    round_number: int,
-) -> dict[str, Any]:
-    commands = detect_check_commands(repo_dir, build_command=build_command, test_command=test_command)
-    checks_dir = run_dir / "checks" / f"round-{round_number:02d}"
-    checks_dir.mkdir(parents=True, exist_ok=True)
-    results: dict[str, Any] = {}
-
-    setup_failed = False
-    if setup_command and setup_command.strip():
-        results["setup"] = _run_one_check(
-            repo_dir,
-            CheckCommand("setup", setup_command.strip()),
-            timeout_seconds=timeout_seconds,
-            log_path=checks_dir / "setup.log",
-        )
-        setup_failed = results["setup"]["status"] != "passed"
-    else:
-        results["setup"] = {
-            "name": "setup", "command": None, "status": "not_requested",
-            "exit_code": None, "duration_seconds": 0.0, "log_file": None,
-            "output_excerpt": "No SETUP_COMMAND configured; dependency setup was not run.",
-        }
-
-    for name in ("build", "test"):
-        command = commands[name]
-        if setup_failed:
-            results[name] = {
-                "name": name, "command": command, "status": "skipped_setup_failed",
-                "exit_code": None, "duration_seconds": 0.0, "log_file": None,
-                "output_excerpt": "Skipped because SETUP_COMMAND failed; see checks/setup.log.",
-            }
-        elif not command:
-            results[name] = {
-                "name": name, "command": None, "status": "not_configured",
-                "exit_code": None, "duration_seconds": 0.0, "log_file": None,
-                "output_excerpt": f"No {name} command detected. Set {name.upper()}_COMMAND or pass --{name}-command. This check is required to pass.",
-            }
-        else:
-            results[name] = _run_one_check(
-                repo_dir, CheckCommand(name, command), timeout_seconds=timeout_seconds,
-                log_path=checks_dir / f"{name}.log",
-            )
-
-    for name, command in (
-        ("git_diff_check", "git diff --check"),
-        ("git_cached_diff_check", "git diff --cached --check"),
-    ):
-        # Only run Git checks in actual Git working copies.
-        results[name] = _run_one_check(
-            repo_dir, CheckCommand(name, command), timeout_seconds=min(timeout_seconds, 120),
-            log_path=checks_dir / f"{name}.log",
-        )
-
-    configured = bool(commands["build"] and commands["test"])
-    passed = configured and not setup_failed and all(
-        results[name]["status"] == "passed"
-        for name in ("build", "test", "git_diff_check", "git_cached_diff_check")
-    )
-    report = {
-        "round": round_number,
-        "configuration_complete": configured,
-        "commands": {"setup": setup_command, **commands},
-        "checks": results,
-        "passed": bool(passed),
-    }
-    (checks_dir / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+            if not cwd.is_relative_to(context.checkout.resolve()):
+                raise ValueError('Verification cwd escapes checkout')
+            remaining = context.deadline - services.clock()
+            if remaining <= 0:
+                raise TimeoutError('Execute Run deadline expired')
+            runner = services.command_runner or context.runtime.run_command_result
+            result = runner(proposed['argv'], cwd=cwd, timeout=min(settings.check_timeout_seconds, remaining),
+                            env=clean_environment())
+            if isinstance(result, CommandResult):
+                output = result.stdout + '\n' + result.stderr
+                check.update(actual_argv=result.argv, duration_seconds=result.duration_seconds)
+            else:
+                output = result
+            check.update(executed=True, status='PASS', exit_code=0, reason='Command executed successfully.')
+            if proposed['kind'] == 'test' and re.search(
+                    r'\b(?:TOTAL\s*:\s*0|Tests run\s*:\s*0|Ran\s+0\s+tests|0\s+passed|No tests (?:found|executed))\b',
+                    output, re.I):
+                check.update(status='UNVERIFIED',
+                    reason='Runner completed without executing test cases despite discovered declarations.')
+        except CommandExecutionError as exc:
+            output = exc.result.stdout + '\n' + exc.result.stderr
+            check.update(executed=True, status='BLOCKED' if exc.result.exit_code is None else 'FAIL',
+                         actual_argv=exc.result.argv, exit_code=exc.result.exit_code,
+                         duration_seconds=exc.result.duration_seconds,
+                         reason=exc.result.reason or 'Command exited unsuccessfully.')
+        except Exception as exc:
+            output = str(exc)
+            check.update(status='BLOCKED', reason='Required command could not execute: ' + type(exc).__name__)
+        check['duration_seconds'] = max(check['duration_seconds'], services.clock() - started, 0)
+        log.write_text(redact(output, settings), encoding='utf-8')
+        checks.append(check)
+    status = ('FAIL' if any(c['status'] == 'FAIL' for c in checks) else
+              'BLOCKED' if any(c['status'] == 'BLOCKED' for c in checks) else
+              'UNVERIFIED' if not checks or any(c['status'] == 'UNVERIFIED' for c in checks) else 'PASS')
+    report = redact(dict(status=status, checks=checks, phase=phase, content_identity=identity,
+                         generated_files=sorted(output_inventory() - before_files),
+                         exclusions=selection['exclusions'], modules=selection['modules']), settings)
+    location = context.artifacts / 'checks' / phase / 'report.json'
+    location.parent.mkdir(parents=True, exist_ok=True)
+    location.write_text(json.dumps(report, indent=2), encoding='utf-8')
     return report
 
 
-def format_check_failures(report: dict[str, Any], *, max_chars: int = 22000) -> str:
-    lines = [
-        f"Build/test validation round {report.get('round')} failed.",
-        "Fix the underlying source/configuration defect. Do not hide, skip, weaken, or delete tests to obtain a pass.",
-    ]
-    checks = report.get("checks") or {}
-    for name in ("setup", "build", "test", "git_diff_check", "git_cached_diff_check"):
-        check = checks.get(name) or {}
-        status = check.get("status", "unknown")
-        if status in {"passed", "not_requested"}:
-            continue
-        lines.extend([
-            f"\n[{name.upper()}] {status.upper()}",
-            f"Command: {check.get('command') or '(not configured)'}",
-            str(check.get("output_excerpt") or "No output captured."),
-        ])
-    text = "\n".join(lines)
-    return text[:max_chars] + "\n...[truncated; full logs saved in run folder]" if len(text) > max_chars else text
+def inventory_directory(current, directories, names):
+    directories[:] = [name for name in directories if name not in {'.git', 'node_modules'}
+                      and not (Path(current) / name).is_symlink()]
+    return [Path(current) / name for name in names if not (Path(current) / name).is_symlink()]

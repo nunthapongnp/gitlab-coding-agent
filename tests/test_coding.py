@@ -20,7 +20,11 @@ def controlled_coding(tmp_path):
 
     transport = Transport(tmp_path / 'unused-source')
     transport.issue['labels'] = ['team', 'agent::approved']
-    transport.notes = [{'id': 123, 'body': render_plan_comment({**plan(), 'schema': PLAN_SCHEMA,
+    fixture_plan = {**plan(), 'commands': [dict(module=module, cwd=module,
+        argv=[sys.executable, '-c', 'from pathlib import Path; assert Path.cwd().is_dir(); print("fixture build validation")'],
+        evidence='Controlled fixture directory validation at the command boundary')
+        for module in ['frontend', 'backend']]}
+    transport.notes = [{'id': 123, 'body': render_plan_comment({**fixture_plan, 'schema': PLAN_SCHEMA,
         'project_id': 42, 'issue_iid': 2, 'branch': 'main', 'commit': 'a' * 40})}]
     client = GitLabClient('https://gitlab.test')
     client.session = transport
@@ -30,6 +34,7 @@ def controlled_coding(tmp_path):
             checkout, artifacts = root / 'checkout', root / 'artifacts'
             checkout.mkdir()
             (checkout / 'frontend').mkdir()
+            (checkout / 'backend').mkdir()
             return Workspace(run_id, checkout, artifacts, branch, 'a' * 40)
 
         def run_command(self, argv, **kwargs):

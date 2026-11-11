@@ -12,6 +12,7 @@ import uuid
 import time
 import queue
 import threading
+import shutil
 from dataclasses import dataclass
 
 from .git_ops import _git_auth_env
@@ -21,6 +22,22 @@ def clean_environment():
     return {key: value for key, value in os.environ.items()
             if key not in {'GITLAB_TOKEN', 'LLM_API_KEY', 'GIT_CONFIG_COUNT'}
             and not key.startswith(('GIT_CONFIG_KEY_', 'GIT_CONFIG_VALUE_'))}
+
+
+@dataclass(frozen=True)
+class CommandResult:
+    argv: list[str]
+    stdout: str
+    stderr: str
+    exit_code: int | None
+    duration_seconds: float
+    reason: str = ''
+
+
+class CommandExecutionError(RuntimeError):
+    def __init__(self, result):
+        super().__init__(result.reason or 'Local command failed')
+        self.result = result
 
 
 @dataclass(frozen=True)
@@ -69,19 +86,37 @@ class LocalRuntime:
         self.coding_sessions = {}
 
     def run_command(self, argv, *, cwd, timeout, env=None):
-        """Explicit cwd and cancellation ownership also serve later role adapters."""
-        self.active = subprocess.Popen(argv, cwd=cwd, env=env or clean_environment(),
+        """Keep stdout compatibility for Git and role callers."""
+        return self.run_command_result(argv, cwd=cwd, timeout=timeout, env=env).stdout
+
+    def run_command_result(self, argv, *, cwd, timeout, env=None):
+        """Retain actual argv, both streams and timing through one cancellation owner."""
+        started = time.monotonic()
+        argv = list(argv)
+        launch = argv
+        executable = shutil.which(argv[0]) or argv[0]
+        if os.name == 'nt' and Path(executable).suffix.lower() in {'.cmd', '.bat'}:
+            if any(any(c in argument for c in '\r\n%!&|<>^') for argument in argv):
+                raise ValueError('Unsupported shell metacharacter in native batch arguments')
+            argv = [os.environ.get('COMSPEC', 'cmd.exe'), '/d', '/s', '/c',
+                    '"' + subprocess.list2cmdline([executable, *argv[1:]]) + '"']
+            # Popen's normal list conversion would escape this cmd /c tail a
+            # second time; cmd requires the deliberate outer quoting verbatim.
+            launch = subprocess.list2cmdline(argv[:4]) + ' ' + argv[4]
+        self.active = subprocess.Popen(launch, cwd=cwd, env=env or clean_environment(),
                                        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                        stderr=subprocess.PIPE, text=True,
                                        start_new_session=os.name != 'nt')
         try:
             stdout, stderr = self.active.communicate(timeout=timeout)
             if self.active.returncode:
-                raise RuntimeError('Local command failed')
-            return stdout
+                raise CommandExecutionError(CommandResult(list(argv), stdout, stderr,
+                    self.active.returncode, time.monotonic() - started))
+            return CommandResult(argv, stdout, stderr, 0, time.monotonic() - started)
         except subprocess.TimeoutExpired:
-            self.cancel()
-            raise RuntimeError('Local command timed out') from None
+            stdout, stderr = self.cancel() or ('', '')
+            raise CommandExecutionError(CommandResult(argv, stdout, stderr, None,
+                time.monotonic() - started, 'Local command timed out')) from None
         finally:
             self.active = None
 
@@ -92,7 +127,7 @@ class LocalRuntime:
                                capture_output=True, check=False)
             else:
                 os.killpg(self.active.pid, signal.SIGKILL)
-            self.active.communicate()
+            return self.active.communicate()
 
     def prepare_workspace(self, project, settings, *, command_runner=None, branch=None,
                           run_id=None, root=None, deadline=None, clock=time.monotonic):

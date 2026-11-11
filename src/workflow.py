@@ -130,12 +130,12 @@ class Application:
             return OperationOutcome(OutcomeStatus.FAILED, str(exc))
         except Exception:
             return OperationOutcome(OutcomeStatus.FAILED, 'Implement preflight failed; no Execute Run accepted.')
-        from .coding import code_issue
+        from .execution import execute_issue
         try:
-            candidate = code_issue(context, settings, self.services)
+            candidate = execute_issue(context, settings, self.services)
             execution = finalize_run(context, candidate, settings, self.services)
         finally:
             context.runtime.close_coder(context.run_id)
         return OperationOutcome(OutcomeStatus.UNAVAILABLE,
-            'Local coding result retained; verification, review and delivery remain unavailable. No publication occurred.',
+            'Local coding and verification evidence retained; review and delivery remain unavailable. No publication occurred.',
             workspace=context.checkout, diagnostics=context.artifacts, run_context=context, execution=execution)

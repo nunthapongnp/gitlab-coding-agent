@@ -145,7 +145,7 @@ def explicit_coverage(path, reference, agreement, issue):
                                reference, re.IGNORECASE)))
 
 
-def code_issue(context, settings, services):
+def code_issue(context, settings, services, *, excluded_paths=()):
     """Only an accepted fresh RunContext grants coding access; never a delivery result."""
     runtime = context.runtime
     command = services.command_runner or runtime.run_command
@@ -203,7 +203,7 @@ def code_issue(context, settings, services):
         except Exception as exc:
             role_error = exc
             response = None
-        result['product_change'] = collect_candidate(context, git,
+        result['product_change'] = collect_candidate(context, git, excluded_paths=excluded_paths,
             secrets=(settings.gitlab_token, settings.llm_api_key))
         result['changed_files'] = [item['path'] for item in result['product_change']['files']]
         current = history_state()
@@ -247,9 +247,10 @@ def code_issue(context, settings, services):
     return result
 
 
-def collect_candidate(context, git, *, secrets=()):
+def collect_candidate(context, git, *, secrets=(), excluded_paths=()):
     paths = set(filter(None, git('diff', '--name-only', '--no-renames', '-z', context.initial_source_commit, '--').split('\0')))
     paths.update(filter(None, git('ls-files', '--others', '--exclude-standard', '-z').split('\0')))
+    paths.difference_update(excluded_paths)
     files = []
     for path in sorted(paths):
         target = context.checkout / path
