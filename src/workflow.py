@@ -130,9 +130,12 @@ class Application:
             return OperationOutcome(OutcomeStatus.FAILED, str(exc))
         except Exception:
             return OperationOutcome(OutcomeStatus.FAILED, 'Implement preflight failed; no Execute Run accepted.')
-        message = ('Execute Run accepted and source prepared; implementation capability is unavailable. '
-                   'No coding or publication occurred.')
-        execution = finalize_run(context, {'status': 'BLOCKED', 'summary': message,
-            'blockers': ['Implementation capability is unavailable.']}, settings, self.services)
-        return OperationOutcome(OutcomeStatus.UNAVAILABLE, message,
+        from .coding import code_issue
+        try:
+            candidate = code_issue(context, settings, self.services)
+            execution = finalize_run(context, candidate, settings, self.services)
+        finally:
+            context.runtime.close_coder(context.run_id)
+        return OperationOutcome(OutcomeStatus.UNAVAILABLE,
+            'Local coding result retained; verification, review and delivery remain unavailable. No publication occurred.',
             workspace=context.checkout, diagnostics=context.artifacts, run_context=context, execution=execution)

@@ -10,6 +10,8 @@ import signal
 import sys
 import uuid
 import time
+import queue
+import threading
 from dataclasses import dataclass
 
 from .git_ops import _git_auth_env
@@ -64,6 +66,7 @@ class LocalRuntime:
     def __init__(self, *, model_runner=None):
         self.model_runner = model_runner
         self.active = None
+        self.coding_sessions = {}
 
     def run_command(self, argv, *, cwd, timeout, env=None):
         """Explicit cwd and cancellation ownership also serve later role adapters."""
@@ -130,6 +133,8 @@ class LocalRuntime:
                 for path in workspace.checkout.rglob('*') if path.is_file()}
 
     def run_role(self, *, role, workspace, prompt, settings):
+        if role == 'coder':
+            return self._run_coder(workspace, prompt, settings)
         if role != 'planner':
             raise ValueError('Role is not enabled')
         model = settings.llm_model
@@ -167,3 +172,76 @@ class LocalRuntime:
             raise RuntimeError('Planner timed out') from None
         finally:
             self.active = None
+
+    def _run_coder(self, workspace, prompt, settings):
+        from .coding import CodingTools
+
+        agreement = json.loads(prompt)
+        session = self.coding_sessions.get(workspace.run_id)
+        if session is None:
+            tools = CodingTools(workspace.checkout, agreement=agreement['approved_plan'],
+                                issue=agreement['issue'], runtime=self, timeout=settings.timeout_seconds)
+            model = settings.llm_model
+            session = dict(context_id=uuid.uuid4().hex, workspace=workspace.checkout,
+                artifacts=workspace.artifacts, tools=tools, state={}, max_iterations=settings.max_iterations,
+                model_options={'model': model if model.startswith('openai/') else 'openai/' + model,
+                    'base_url': settings.llm_base_url.rstrip('/'), 'api_key': settings.llm_api_key,
+                    'timeout': settings.timeout_seconds, 'num_retries': 0})
+            self.coding_sessions[workspace.run_id] = session
+        if session['workspace'] != workspace.checkout:
+            raise ValueError('Coding conversation belongs to another workspace')
+        if self.model_runner:
+            response = self.model_runner(**session, prompt=prompt)
+            if isinstance(response, dict):
+                response = {**response, 'changes': list(session['tools'].changes.values()),
+                            'commands': session['tools'].commands, 'tool_blockers': session['tools'].blockers}
+            return response
+        return self._coder_worker(session, prompt, settings)
+
+    def _coder_worker(self, session, prompt, settings):
+        if 'process' not in session:
+            role_home = session['artifacts'] / ('coder-home-' + session['context_id'])
+            role_home.mkdir()
+            role_env = clean_environment()
+            role_env.update(HOME=str(role_home), USERPROFILE=str(role_home),
+                            OH_PERSISTENCE_DIR=str(role_home / '.openhands'), OPENHANDS_SUPPRESS_BANNER='1')
+            process = subprocess.Popen([sys.executable, '-m', 'src.coder_worker'],
+                cwd=Path(__file__).resolve().parent.parent, env=role_env, stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                start_new_session=os.name != 'nt')
+            lines = queue.Queue()
+            def read_lines():
+                for line in process.stdout:
+                    lines.put(line)
+                lines.put(None)
+            threading.Thread(target=read_lines, daemon=True).start()
+            session.update(process=process, lines=lines)
+        self.active = session['process']
+        try:
+            payload = {key: str(value) if isinstance(value, Path) else value for key, value in session.items()
+                       if key in {'context_id', 'workspace', 'artifacts', 'model_options', 'max_iterations'}}
+            payload.update(prompt=prompt, agreement=session['tools'].agreement, issue=session['tools'].issue)
+            self.active.stdin.write(json.dumps(payload) + '\n')
+            self.active.stdin.flush()
+            line = session['lines'].get(timeout=settings.timeout_seconds)
+            if line is None:
+                raise RuntimeError('Coder worker exited before structured output')
+            message = json.loads(line)
+            if 'error' in message:
+                raise RuntimeError('Coder SDK execution failed')
+            return message['result']
+        except (queue.Empty, BrokenPipeError):
+            self.cancel()
+            raise RuntimeError('Coder timed out or exited') from None
+        finally:
+            self.active = None
+
+    def close_coder(self, run_id):
+        """Release the run-local conversation after finalization; never save it for reuse."""
+        session = self.coding_sessions.pop(run_id, None)
+        if session and 'process' in session:
+            self.active = session['process']
+            try:
+                self.cancel()
+            finally:
+                self.active = None
