@@ -133,74 +133,78 @@ def test_accepted_run_refuses_a_checkout_of_the_wrong_branch(approved):
     assert result.diagnostics.exists()
     assert transport.mr['labels'] == ['team', 'agent::in-progress']
 
-@pytest.mark.parametrize('invalid', [
+INVALID_REQUESTS = [
     'no-approval', 'conflicting-issue-labels', 'no-plan', 'duplicate-plan', 'malformed-plan',
     'plain-text-plan', 'wrong-project-plan', 'wrong-issue-plan', 'closed-mr', 'forked-mr',
     'different-target-project', 'wrong-mr-project', 'wrong-mr-iid', 'unlinked-mr',
     'missing-source', 'missing-target', 'wrong-target', 'same-branches',
     'conflicting-mr-labels', 'stale-in-progress', 'prior-report', 'cross-project-reference',
-])
-def test_rejected_preflight_has_no_lifecycle_writes_or_local_work(approved, invalid):
+]
+
+def test_rejected_preflight_has_no_lifecycle_writes_or_local_work(approved):
     from dataclasses import replace
     from src.agreement import parse_plan_comment, render_plan_comment
     app, transport, source = approved
-    if invalid == 'no-approval':
-        transport.issue['labels'] = ['team']
-    elif invalid == 'conflicting-issue-labels':
-        transport.issue['labels'].append('agent::needs-review')
-    elif invalid == 'no-plan':
-        transport.notes.clear()
-    elif invalid == 'duplicate-plan':
-        transport.notes.append(dict(transport.notes[0], id=124))
-    elif invalid == 'malformed-plan':
-        transport.notes[0]['body'] = '<!-- coding-agent:execution-plan -->\n{}'
-    elif invalid == 'plain-text-plan':
-        transport.notes[0]['body'] = '# Execution Plan\nShow task IDs'
-    elif invalid in {'wrong-project-plan', 'wrong-issue-plan'}:
-        agreement = parse_plan_comment(transport.notes[0]['body'])
-        agreement['project_id' if invalid == 'wrong-project-plan' else 'issue_iid'] = 999
-        transport.notes[0]['body'] = render_plan_comment(agreement)
-    elif invalid == 'closed-mr':
-        transport.mr['state'] = 'closed'
-    elif invalid == 'forked-mr':
-        transport.mr['source_project_id'] = 999
-    elif invalid == 'different-target-project':
-        transport.mr['target_project_id'] = 999
-    elif invalid == 'wrong-mr-project':
-        transport.mr['project_id'] = 999
-    elif invalid == 'wrong-mr-iid':
-        transport.mr['iid'] = 999
-    elif invalid == 'unlinked-mr':
-        transport.related.clear()
-    elif invalid == 'missing-source':
-        transport.branches.remove('human/task-2')
-    elif invalid == 'missing-target':
-        transport.branches.remove('main')
-    elif invalid == 'wrong-target':
-        transport.mr['target_branch'] = 'another-main'
-    elif invalid == 'same-branches':
-        transport.mr['source_branch'] = 'main'
-    elif invalid == 'conflicting-mr-labels':
-        transport.mr['labels'].append('agent::approved')
-    elif invalid == 'stale-in-progress':
-        transport.mr['labels'] = ['agent::in-progress']
-    elif invalid == 'prior-report':
-        transport.mr_notes = [{'id': 55, 'body': '<!-- coding-agent:execution-report run=old -->\nFailed'}]
-    elif invalid == 'cross-project-reference':
-        transport.related.clear()
-        transport.mr['description'] = 'Closes other/project#2'
+    initial = copy.deepcopy(transport.__dict__)
+    for invalid in INVALID_REQUESTS:
+        transport.__dict__.update(copy.deepcopy(initial))
+        if invalid == 'no-approval':
+            transport.issue['labels'] = ['team']
+        elif invalid == 'conflicting-issue-labels':
+            transport.issue['labels'].append('agent::needs-review')
+        elif invalid == 'no-plan':
+            transport.notes.clear()
+        elif invalid == 'duplicate-plan':
+            transport.notes.append(dict(transport.notes[0], id=124))
+        elif invalid == 'malformed-plan':
+            transport.notes[0]['body'] = '<!-- coding-agent:execution-plan -->\n{}'
+        elif invalid == 'plain-text-plan':
+            transport.notes[0]['body'] = '# Execution Plan\nShow task IDs'
+        elif invalid in {'wrong-project-plan', 'wrong-issue-plan'}:
+            agreement = parse_plan_comment(transport.notes[0]['body'])
+            agreement['project_id' if invalid == 'wrong-project-plan' else 'issue_iid'] = 999
+            transport.notes[0]['body'] = render_plan_comment(agreement)
+        elif invalid == 'closed-mr':
+            transport.mr['state'] = 'closed'
+        elif invalid == 'forked-mr':
+            transport.mr['source_project_id'] = 999
+        elif invalid == 'different-target-project':
+            transport.mr['target_project_id'] = 999
+        elif invalid == 'wrong-mr-project':
+            transport.mr['project_id'] = 999
+        elif invalid == 'wrong-mr-iid':
+            transport.mr['iid'] = 999
+        elif invalid == 'unlinked-mr':
+            transport.related.clear()
+        elif invalid == 'missing-source':
+            transport.branches.remove('human/task-2')
+        elif invalid == 'missing-target':
+            transport.branches.remove('main')
+        elif invalid == 'wrong-target':
+            transport.mr['target_branch'] = 'another-main'
+        elif invalid == 'same-branches':
+            transport.mr['source_branch'] = 'main'
+        elif invalid == 'conflicting-mr-labels':
+            transport.mr['labels'].append('agent::approved')
+        elif invalid == 'stale-in-progress':
+            transport.mr['labels'] = ['agent::in-progress']
+        elif invalid == 'prior-report':
+            transport.mr_notes = [{'id': 55, 'body': '<!-- coding-agent:execution-report run=old -->\nFailed'}]
+        elif invalid == 'cross-project-reference':
+            transport.related.clear()
+            transport.mr['description'] = 'Closes other/project#2'
 
-    def forbidden(*args, **kwargs):
-        pytest.fail('Rejected preflight started a command or clock')
-    app.services = replace(app.services, command_runner=forbidden, clock=forbidden)
-    before_issue, before_mr = copy.deepcopy(transport.issue), copy.deepcopy(transport.mr)
-    before_dirs = set(app.settings.output_dir.iterdir())
-    result = app.invoke(OperationInput('implement', 'team/demo', 2, 12))
-    assert result.status == OutcomeStatus.FAILED
-    assert result.run_context is None
-    assert all(method == 'GET' for method, path, data in transport.calls)
-    assert set(app.settings.output_dir.iterdir()) == before_dirs
-    assert transport.issue == before_issue and transport.mr == before_mr
+        def forbidden(*args, **kwargs):
+            pytest.fail('Rejected preflight started a command or clock')
+        app.services = replace(app.services, command_runner=forbidden, clock=forbidden)
+        before_issue, before_mr = copy.deepcopy(transport.issue), copy.deepcopy(transport.mr)
+        before_dirs = set(app.settings.output_dir.iterdir())
+        result = app.invoke(OperationInput('implement', 'team/demo', 2, 12))
+        assert result.status == OutcomeStatus.FAILED
+        assert result.run_context is None
+        assert all(method == 'GET' for method, path, data in transport.calls)
+        assert set(app.settings.output_dir.iterdir()) == before_dirs
+        assert transport.issue == before_issue and transport.mr == before_mr
 
 
 def test_empty_draft_source_and_explicit_same_project_closing_reference_are_valid(approved):
