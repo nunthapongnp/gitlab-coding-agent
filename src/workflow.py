@@ -31,6 +31,7 @@ class OperationOutcome:
     inspection: dict | None = None
     workspace: Path | None = None
     diagnostics: Path | None = None
+    run_context: Any = None
 
     @property
     def succeeded(self) -> bool:
@@ -114,6 +115,16 @@ class Application:
                 return OperationOutcome(OutcomeStatus.FAILED, str(exc))
             except Exception:
                 return OperationOutcome(OutcomeStatus.FAILED, 'Explore failed; no executable plan published.')
+        from .implement import prepare_run, RunPreparationError
+        try:
+            context = prepare_run(request, settings, self.services)
+        except RunPreparationError as exc:
+            return OperationOutcome(OutcomeStatus.FAILED, str(exc),
+                workspace=exc.context.checkout, diagnostics=exc.context.artifacts, run_context=exc.context)
+        except ValueError as exc:
+            return OperationOutcome(OutcomeStatus.FAILED, str(exc))
+        except Exception:
+            return OperationOutcome(OutcomeStatus.FAILED, 'Implement preflight failed; no Execute Run accepted.')
         return OperationOutcome(OutcomeStatus.UNAVAILABLE,
-                                f"The {request.operation} operation is not enabled yet; "
-                                "install the remaining Phase 0 workflow capabilities before retrying.")
+            'Execute Run accepted and source prepared; implementation capability is unavailable. No coding or publication occurred.',
+            workspace=context.checkout, diagnostics=context.artifacts, run_context=context)

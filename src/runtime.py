@@ -9,6 +9,7 @@ import subprocess
 import signal
 import sys
 import uuid
+import time
 from dataclasses import dataclass
 
 from .git_ops import _git_auth_env
@@ -90,31 +91,37 @@ class LocalRuntime:
                 os.killpg(self.active.pid, signal.SIGKILL)
             self.active.communicate()
 
-    def prepare_workspace(self, project, settings, *, command_runner=None):
+    def prepare_workspace(self, project, settings, *, command_runner=None, branch=None,
+                          run_id=None, root=None, deadline=None, clock=time.monotonic):
         from urllib.parse import urlsplit
 
         url = project['http_url_to_repo']
         parsed = urlsplit(url)
         if parsed.username or parsed.password or parsed.query or parsed.fragment:
             raise ValueError('Repository URL must not contain credentials or query parameters')
-        branch = project['default_branch']
+        branch = branch if branch is not None else project['default_branch']
         if not isinstance(branch, str) or not branch or branch.startswith('-'):
             raise ValueError('Project default branch is missing or invalid')
-        run_id = uuid.uuid4().hex
-        root = settings.output_dir.resolve() / run_id
+        run_id = run_id or uuid.uuid4().hex
+        root = Path(root) if root is not None else settings.output_dir.resolve() / run_id
         # Never nest a product checkout inside another Git working tree.
         if any((parent / '.git').exists() for parent in (root, *root.parents)):
             raise ValueError('Output directory must be outside Git checkouts')
         artifacts = root / 'artifacts'
-        artifacts.mkdir(parents=True)
+        artifacts.mkdir(parents=True, exist_ok=True)
         checkout = root / 'checkout'
         command = command_runner or self.run_command
+        def timeout(limit):
+            remaining = limit if deadline is None else min(limit, deadline - clock())
+            if remaining <= 0:
+                raise RuntimeError('Execute Run deadline expired')
+            return remaining
         command(['git', '-c', 'core.hooksPath=' + str(artifacts / 'disabled-hooks'),
                  'clone', '--no-hardlinks', '--branch', branch, '--', url, str(checkout)],
-                cwd=root, timeout=settings.timeout_seconds,
+                cwd=root, timeout=timeout(settings.timeout_seconds),
                 env=_git_auth_env(settings.gitlab_token, settings.gitlab_git_username))
         commit = command(['git', 'rev-parse', 'HEAD'], cwd=checkout,
-                         timeout=30, env=clean_environment()).strip()
+                         timeout=timeout(30), env=clean_environment()).strip()
         return Workspace(run_id, checkout, artifacts, branch, commit)
 
     def snapshot(self, workspace):

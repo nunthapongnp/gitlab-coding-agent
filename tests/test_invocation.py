@@ -33,39 +33,6 @@ def test_invalid_invocation_stops_before_startup(args):
     assert "LLM_BASE_URL" not in output.getvalue()
 
 
-@pytest.mark.parametrize("operation,mr_iid", [("implement", 12)])
-def test_valid_incomplete_operations_refuse_all_external_effects(operation, mr_iid, tmp_path):
-    from src.config import Settings
-    from src.workflow import Application, ApplicationServices, OperationInput, OutcomeStatus
-
-    class ForbiddenService:
-        def __getattr__(self, name):
-            pytest.fail(f"Unavailable operation accessed an external service: {name}")
-
-        def __call__(self, *args, **kwargs):
-            pytest.fail("Unavailable operation started external work")
-
-    forbidden = ForbiddenService()
-    services = ApplicationServices(gitlab=forbidden, role_runtime=forbidden,
-                                   command_runner=forbidden, clock=forbidden)
-    settings = Settings.from_env(environ=CONFIG, output_dir=tmp_path / "runs")
-    result = Application(settings=settings, services=services).invoke(
-        OperationInput(operation, "team/demo", 4, mr_iid)
-    )
-    assert result.status == OutcomeStatus.UNAVAILABLE
-    assert result.exit_code == 4
-    assert operation in result.message
-    assert not list(tmp_path.iterdir())
-
-    args = [operation, "--project", "team/demo", "--issue", "4"]
-    if mr_iid:
-        args += ["--mr", str(mr_iid)]
-    output = StringIO()
-    assert main(args, environ=CONFIG, services=services, stderr=output) == result.exit_code
-    assert "unavailable" in output.getvalue()
-    assert "SUCCESS" not in output.getvalue()
-
-
 @pytest.mark.parametrize("missing", ["GITLAB_TOKEN", "LLM_BASE_URL", "LLM_MODEL", "LLM_API_KEY"])
 def test_missing_configuration_is_actionable_and_never_prints_secrets(missing):
     config = {key: value for key, value in CONFIG.items() if key != missing}

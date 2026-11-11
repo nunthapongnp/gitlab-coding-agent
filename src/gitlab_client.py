@@ -102,6 +102,45 @@ class GitLabClient:
         return self._request('POST', f'projects/{self._project_path(project)}/issues/{issue_iid}/notes',
                              json={'body': body})
 
+    def _all_pages(self, path):
+        items, page = [], 1
+        while True:
+            payload = self._request('GET', path, params={'page': page, 'per_page': 100})
+            if not isinstance(payload, list):
+                raise GitLabAPIError('GitLab returned an unexpected paginated response')
+            if not payload:
+                return items
+            items.extend(payload)
+            page += 1
+
+    def get_merge_request(self, project, mr_iid):
+        payload = self._request('GET', f'projects/{self._project_path(project)}/merge_requests/{mr_iid}')
+        if not isinstance(payload, dict):
+            raise GitLabAPIError('GitLab returned an unexpected MR response')
+        return payload
+
+    def get_merge_request_notes(self, project, mr_iid):
+        return self._all_pages(f'projects/{self._project_path(project)}/merge_requests/{mr_iid}/notes')
+
+    def get_issue_related_merge_requests(self, project, issue_iid):
+        return self._all_pages(f'projects/{self._project_path(project)}/issues/{issue_iid}/related_merge_requests')
+
+    def get_branch(self, project, branch):
+        payload = self._request('GET', f'projects/{self._project_path(project)}/repository/branches/{quote(branch, safe="")}')
+        if not isinstance(payload, dict):
+            raise GitLabAPIError('GitLab returned an unexpected branch response')
+        return payload
+
+    def replace_merge_request_status(self, project, mr_iid, expected, replacement):
+        mr = self.get_merge_request(project, mr_iid)
+        if set(mr.get('labels', [])) & RECOGNIZED_LABELS != {expected}:
+            raise GitLabAPIError('MR workflow labels changed; manual review required')
+        payload = self._request('PUT', f'projects/{self._project_path(project)}/merge_requests/{mr_iid}',
+            json={'remove_labels': expected, 'add_labels': replacement})
+        if not isinstance(payload, dict) or set(payload.get('labels', [])) & RECOGNIZED_LABELS != {replacement}:
+            raise GitLabAPIError('MR label replacement was not confirmed')
+        return payload
+
     def find_open_merge_request(
         self, project: str | int, source_branch: str, target_branch: str
     ) -> dict | None:
