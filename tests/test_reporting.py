@@ -47,7 +47,7 @@ def test_stopped_accepted_run_hands_off_one_truthful_report_and_local_result(han
     app, transport, source_repo = handoff
     mr_before, issue_before = copy.deepcopy(transport.mr), copy.deepcopy(transport.issue)
     result = app.invoke(OperationInput('implement', 'team/demo', 2, 12))
-    assert result.status == OutcomeStatus.UNAVAILABLE
+    assert result.status == OutcomeStatus.FAILED
     assert transport.report_attempts == 1
     assert transport.mr == {**mr_before, 'labels': ['team', 'agent::needs-review']}
     assert transport.issue == issue_before
@@ -84,7 +84,7 @@ def test_expired_accepted_run_retains_handoff_without_claiming_submission(handof
     result = app.invoke(OperationInput('implement', 'team/demo', 2, 12))
     assert result.status == OutcomeStatus.FAILED
     assert transport.report_attempts == 0
-    assert result.execution['status'] == 'BLOCKED'
+    assert result.execution['status'] == 'TIMEOUT'
     assert result.execution['report_delivery']['status'] == 'NOT_ATTEMPTED'
     assert result.execution['label_update']['status'] == 'NOT_ATTEMPTED'
     assert result.execution['duration_seconds'] == 3600.0
@@ -113,7 +113,7 @@ def test_report_and_label_failures_are_independent_and_never_duplicate(handoff, 
 
     transport.request = request
     result = app.invoke(OperationInput('implement', 'team/demo', 2, 12))
-    assert result.status == OutcomeStatus.UNAVAILABLE
+    assert result.status == OutcomeStatus.FAILED
     evidence = result.execution
     assert transport.report_attempts == 1
     assert evidence['report_delivery']['status'] == (

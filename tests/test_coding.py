@@ -189,8 +189,9 @@ def test_explicit_dependency_scope_allows_configuration_without_exhaustive_file_
 
     def coder(**context):
         if json.loads(context['prompt'])['role'] == 'reviewer':
-            from test_review import approval
-            return approval(json.loads(context['prompt']))
+            # This test proves coding authorization, with delivery deliberately
+            # withheld at the independent review boundary.
+            return {}
         context['tools'].call('write', 'frontend/package.json',
             content='{"scripts":{"build":"ng build"},"dependencies":{"task-ids":"1.0.0"}}',
             reason='Approved task ID dependency', acceptance_ids=['A1'], approval_reference=reference)
@@ -201,7 +202,8 @@ def test_explicit_dependency_scope_allows_configuration_without_exhaustive_file_
 
     app.services = replace(app.services, role_runtime=LocalRuntime(model_runner=coder))
     result = app.invoke(OperationInput('implement', 'team/demo', 2, 12))
-    assert result.execution['status'] == 'UNVERIFIED', result.execution
+    assert result.execution['review']['status'] == 'BLOCKED', result.execution
+    assert json.loads((result.diagnostics / 'coding-result.json').read_text())['status'] == 'UNVERIFIED'
     assert result.execution['changed_files'] == ['frontend/package-lock.json', 'frontend/package.json']
 
 
@@ -212,8 +214,7 @@ def test_implement_returns_complete_local_candidate_preserving_human_history(app
 
     def coder(**context):
         if json.loads(context['prompt'])['role'] == 'reviewer':
-            from test_review import approval
-            return approval(json.loads(context['prompt']))
+            return {}  # Keep this local-candidate test below the delivery gate.
         calls.append(context)
         agreement = json.loads(context['prompt'])
         assert agreement['approved_plan']['requirement'] == 'Show task IDs'
@@ -229,7 +230,7 @@ def test_implement_returns_complete_local_candidate_preserving_human_history(app
     result = app.invoke(OperationInput('implement', 'team/demo', 2, 12))
     assert result.execution is not None, result
     candidate = result.execution
-    assert candidate['status'] == 'UNVERIFIED'
+    assert candidate['status'] == 'BLOCKED' and candidate['review']['status'] == 'BLOCKED'
     assert candidate['changed_files'] == ['backend/Task.java', 'frontend/task ids.ts']
     inventory = candidate['product_change']['files']
     assert base64.b64decode(inventory[1]['after']['content_base64']) == b'export const taskId = 2;\n'
@@ -238,11 +239,13 @@ def test_implement_returns_complete_local_candidate_preserving_human_history(app
     assert git(result.workspace, 'log', '--format=%H') == history
     assert git(result.workspace, 'diff', '--cached', '--name-only') == ''
     assert git(source, 'status', '--porcelain') == ''
-    assert not result.succeeded and result.status == OutcomeStatus.UNAVAILABLE
+    assert not result.succeeded and result.status == OutcomeStatus.FAILED
     assert len(calls) == 1
     assert calls[0]['artifacts'] == result.diagnostics
     coding_result = json.loads((result.diagnostics / 'coding-result.json').read_text())
-    assert all(candidate[key] == value for key, value in coding_result.items())
+    assert coding_result['status'] == 'UNVERIFIED'
+    assert coding_result['blockers'] == []
+    assert all(candidate[key] == value for key, value in coding_result.items() if key not in {'status', 'blockers'})
     assert [(method, path) for method, path, _ in transport.calls if method == 'POST'] == [
         ('POST', 'projects/42/merge_requests/12/notes')]
     assert {item.name for item in result.workspace.iterdir()} == {'.git', 'frontend', 'backend', 'AGENTS.md', 'human.txt'}
@@ -293,8 +296,7 @@ def test_coder_sdk_offers_scoped_tools_and_keeps_conversation_only_within_run(ap
     class Runtime(LocalRuntime):
         def run_role(self, *, role, prompt, **kwargs):
             if role == 'reviewer':
-                from test_review import approval
-                return approval(json.loads(prompt))
+                return {}  # Exercise the real coder SDK without granting delivery.
             return super().run_role(role=role, prompt=prompt, **kwargs)
     runtime = Runtime()
     app.settings = replace(app.settings, llm_base_url=f'http://127.0.0.1:{proxy.server_port}/v1', timeout_seconds=60)
@@ -305,7 +307,9 @@ def test_coder_sdk_offers_scoped_tools_and_keeps_conversation_only_within_run(ap
         proxy.shutdown()
         proxy.server_close()
         thread.join()
-    assert result.execution['status'] == 'UNVERIFIED', result.execution
+    assert result.execution['status'] == 'BLOCKED', result.execution
+    assert result.execution['review']['status'] == 'BLOCKED'
+    assert json.loads((result.diagnostics / 'coding-result.json').read_text())['status'] == 'UNVERIFIED'
     assert result.execution['changed_files'] == ['frontend/task.ts']
     assert len(requests) == 3
     assert (result.workspace / 'frontend/task.ts').read_text() == 'export const taskId = 2;'

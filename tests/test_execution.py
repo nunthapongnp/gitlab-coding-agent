@@ -128,7 +128,9 @@ def test_review_repair_requires_checks_and_new_approval_for_new_content(executio
     assert identities[0] != identities[1]
     assert result.execution['product_verification']['phase'] == 'repair-1'
     assert result.execution['product_verification']['content_identity'] == identities[1]
-    assert result.execution['publication_eligible'] is True
+    # Synthetic Git evidence can pass orchestration checks but cannot authorize
+    # delivery; the real publication boundary rejects its absent Git history.
+    assert result.execution['publication_eligible'] is False
 
 
 def test_deadline_denies_late_coder_mutations_and_reserves_finalization(execution_app):
@@ -150,7 +152,7 @@ def test_deadline_denies_late_coder_mutations_and_reserves_finalization(executio
 def test_initial_success_needs_one_coder_and_one_fresh_review(execution_app):
     invoke, roles, commands, clock = execution_app
     result = invoke()
-    assert result.execution['publication_eligible'] is True, result.execution
+    assert result.execution['publication_eligible'] is False, result.execution
     assert [role for role, _, _ in roles] == ['coder', 'reviewer']
     assert result.execution['coding_attempts'] == 1
     assert result.execution['repairs'] == []

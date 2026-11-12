@@ -107,7 +107,7 @@ def test_implement_uses_gitlab_plan_and_exact_fresh_source_without_explore_state
     mr_before = copy.deepcopy(transport.mr)
     history = git(source, 'log', '--format=%H')
     result = app.invoke(OperationInput('implement', 'team/demo', 2, 12))
-    assert result.status == OutcomeStatus.UNAVAILABLE, result.message
+    assert result.status == OutcomeStatus.FAILED, result.message
     context = result.run_context
     assert context is not None
     assert context.plan_comment_id == 123
@@ -234,7 +234,7 @@ def test_empty_draft_source_and_explicit_same_project_closing_reference_are_vali
     transport.related = [{'iid': 99, 'project_id': 42}]
     transport.mr['description'] = 'Human notes\n\nCloses team/demo#2'
     result = app.invoke(OperationInput('implement', 'team/demo', 2, 12))
-    assert result.status == OutcomeStatus.UNAVAILABLE
+    assert result.status == OutcomeStatus.FAILED
     assert result.run_context.mr['iid'] == 12
     assert git(result.workspace, 'rev-parse', 'HEAD') == git(source, 'rev-parse', 'main')
     assert git(result.workspace, 'diff', 'origin/main', '--') == ''

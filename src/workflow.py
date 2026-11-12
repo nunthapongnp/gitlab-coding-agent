@@ -1,7 +1,7 @@
 """Application invocation boundary for the manual Phase 0 workflow.
 
-The automatic POC graph has been retired. Later slices enable operations here;
-there is deliberately no fallback to branch creation or unverified publication.
+Explicit explore and implement operations have no fallback to branch creation
+or unverified publication.
 """
 from __future__ import annotations
 
@@ -131,15 +131,33 @@ class Application:
         except Exception:
             return OperationOutcome(OutcomeStatus.FAILED, 'Implement preflight failed; no Execute Run accepted.')
         from .execution import execute_issue
+        from .publication import publish_issue
         try:
             candidate = execute_issue(context, settings, self.services)
-            execution = finalize_run(context, candidate, settings, self.services)
         finally:
-            context.runtime.close_coder(context.run_id)
+            try:
+                context.runtime.close_coder(context.run_id)
+            except Exception as exc:
+                try:
+                    context.runtime.cancel()
+                except Exception:
+                    pass
+                candidate.update(status='BLOCKED', publication_eligible=False)
+                candidate.setdefault('blockers', []).append('Coder shutdown was not confirmed; publication is withheld.')
+                candidate.setdefault('errors', []).append(dict(phase='coder-shutdown', error_type=type(exc).__name__))
+        candidate = publish_issue(context, candidate, settings, self.services)
+        execution = finalize_run(context, candidate, settings, self.services)
+        if execution['status'] == 'SUCCESS':
+            handoff = (execution['report_delivery']['status'] == 'DELIVERED'
+                       and execution['label_update']['status'] == 'UPDATED')
+            return OperationOutcome(OutcomeStatus.SUCCESS if handoff else OutcomeStatus.FAILED,
+                'Product Change delivered; complete human acceptance and MR review.' if handoff else
+                'Product Change delivered; report or MR label handoff needs operator attention.',
+                workspace=context.checkout, diagnostics=context.artifacts, run_context=context, execution=execution)
         if execution['status'] in {'TIMEOUT', 'EXHAUSTED'}:
             return OperationOutcome(OutcomeStatus.FAILED,
                 f"Execute Run {execution['status']}; inspect retained attempt evidence and diagnostics.",
                 workspace=context.checkout, diagnostics=context.artifacts, run_context=context, execution=execution)
-        return OperationOutcome(OutcomeStatus.UNAVAILABLE,
-            'Local coding, verification and independent review evidence retained; delivery remains unavailable. No publication occurred.',
+        return OperationOutcome(OutcomeStatus.FAILED,
+            'Execute Run stopped; inspect verification, review and publication evidence.',
             workspace=context.checkout, diagnostics=context.artifacts, run_context=context, execution=execution)

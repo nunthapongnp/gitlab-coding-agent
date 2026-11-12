@@ -55,7 +55,14 @@ def _render(result):
                   '', '## Diagnostics', result['diagnostics']['directory'],
                   'Final result: execution-result.json; report: execution-report.md; log: finalization.log.',
                   '', '## Next human action', result['next_human_action']])
-    return '\n'.join(lines) + '\n'
+    # GitLab interprets standalone slash commands before rendering Markdown.
+    # Neutralize every possible command line, including model-supplied fence
+    # escapes; the original structured evidence remains in the local result.
+    # GitLab's note extractor removes raw CR and trims trailing whitespace.
+    # Submit exactly that canonical body so strict delivery readback remains valid.
+    body = '\n'.join(lines).replace('\r', '').rstrip()
+    return '\n'.join(line.replace('/', '&#47;', 1) if line.lstrip().startswith('/') else line
+                     for line in body.split('\n'))
 
 
 def finalize_run(context, result, settings, services):
@@ -119,7 +126,7 @@ def finalize_run(context, result, settings, services):
                     if clean != original:
                         path.write_bytes(clean.encode('utf-8', errors='surrogateescape'))
             aggregate['diagnostics']['status'] = 'SAVED'
-            (context.artifacts / 'execution-report.md').write_text(body, encoding='utf-8')
+            (context.artifacts / 'execution-report.md').write_text(body, encoding='utf-8', newline='')
             (context.artifacts / 'finalization.log').write_text(_redact('\n'.join(events), settings), encoding='utf-8')
             (context.artifacts / 'execution-result.json').write_text(
                 json.dumps(aggregate, indent=2, ensure_ascii=False), encoding='utf-8')
