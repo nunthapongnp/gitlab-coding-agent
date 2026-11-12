@@ -2,13 +2,13 @@
 
 Status: accepted design. This contract supersedes conflicting earlier Phase 0 documents, ADR requirements, report templates, specifications, and draft tickets. Authoritative implementation work: [GitHub Issue #6](https://github.com/nunthapongnp/gitlab-coding-agent/issues/6) and its eleven linked slices. The historical eighteen-ticket breakdown is inactive.
 
-The invocation/configuration foundation from #7 is implemented. Explore and implement remain explicitly unavailable until later capabilities land. Requirements below describe the intended complete workflow, not proof of implemented features.
+The manual explore/implement workflow is implemented, including aggregate commit and normal push after verification and independent review. The [operator guide](OPERATOR_GUIDE.md) describes prerequisites, human handoffs and reset paths. The [walkthrough evidence](WALKTHROUGH_EVIDENCE.md) separates deterministic checks from the opt-in live pilot; the live walkthrough has not been performed.
 
 ## Invocation and ownership
 
 Use `explore --project PROJECT --issue IID` and `implement --project PROJECT --issue IID --mr IID`. IIDs must be positive. The subcommand chooses the operation; labels never select a mode or trigger a background run. The human owns Issue creation, approval, source branch/MR creation, toolchain preparation, reset, acceptance, and merge. The agent never creates a product branch/MR, changes MR metadata/target, approves, or merges.
 
-Develop and merge framework tickets on `feature/phase-0`; preserve the main POC baseline. Keep the application/workflow boundary with replaceable GitLab, role runtime, verification command execution, and monotonic clock at `Application.invoke`. Importing the entrypoint starts no workflow. Incomplete operations return unavailable without the POC fallback.
+Develop and merge framework tickets on `feature/phase-0`; preserve the main POC baseline. Keep the application/workflow boundary with replaceable GitLab, role runtime, verification command execution, and monotonic clock at `Application.invoke`. Importing the entrypoint starts no workflow; there is no POC fallback.
 
 ## GitLab agreement and labels
 
