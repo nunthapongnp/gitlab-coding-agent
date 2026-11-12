@@ -217,6 +217,20 @@ def test_preparation_uses_accepted_deadline_and_stops_before_baseline_or_coder(e
     assert result.execution['commit']['status'] == result.execution['push']['status'] == 'NOT_ATTEMPTED'
 
 
+def test_clone_process_timeout_reports_expired_accepted_budget(execution_app):
+    invoke, roles, commands, clock = execution_app
+    def configure(runtime, clock, command):
+        def expired(*args, **kwargs):
+            clock[0] = 109.1
+            raise CommandExecutionError(CommandResult(['git', 'clone'], '', '', None, 9,
+                                                       'Local command timed out'))
+        runtime.prepare_workspace = expired
+    result = invoke(configure=configure, runtime_seconds=10)
+    assert result.execution['status'] == 'TIMEOUT', result.execution
+    assert result.execution['errors'][0]['error_type'] == 'CommandExecutionError'
+    assert roles == []
+
+
 def test_expired_workflow_kills_ready_child_tree_before_reporting_timeout(execution_app):
     invoke, roles, commands, clock = execution_app
     def check_runner(runtime, argv, kwargs):
