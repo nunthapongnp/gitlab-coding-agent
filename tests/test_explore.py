@@ -73,6 +73,61 @@ def plan():
             'commands': [], 'unresolved_questions': []}
 
 
+def test_explore_redacts_escaped_credentials_in_issue_comments_and_plan(source, tmp_path):
+    from dataclasses import replace
+    from src.runtime import LocalRuntime
+
+    secret = 'publication-"key\\with\nnonascii-\u03bb'
+    model_key = 'model-"key\\with\tcontrols'
+
+    class Discussion(GitLab):
+        def get_issue(self, project, iid):
+            return {**super().get_issue(project, iid), 'description': 'Task IDs ' + secret}
+
+    client = Discussion(source)
+    client.notes = [{'body': 'Discussion ' + model_key}]
+    def model(**context):
+        payload = json.loads(context['prompt'])
+        assert payload['issue']['description'] == 'Task IDs [REDACTED]'
+        assert payload['comments'] == ['Discussion [REDACTED]']
+        return {**plan(), 'requirement': 'Show task IDs ' + secret,
+                'verification': [{'description': 'Build ' + model_key}]}
+
+    result = Application(settings=replace(settings(tmp_path), gitlab_token=secret, llm_api_key=model_key),
+        services=ApplicationServices(gitlab=client, role_runtime=LocalRuntime(model_runner=model))).invoke(
+            OperationInput('explore', 'team/demo', 2))
+    assert result.succeeded, result
+    assert result.inspection['plan']['verification'] == [{'description': 'Build [REDACTED]'}]
+    assert result.inspection['agreement']['requirement'] == 'Show task IDs [REDACTED]'
+    for path in result.diagnostics.rglob('*'):
+        if path.is_file():
+            retained = json.loads(path.read_text()) if path.suffix == '.json' else path.read_text()
+            assert secret not in str(retained) and model_key not in str(retained)
+
+
+def test_read_only_model_observations_filter_source_without_granting_authority(source, tmp_path):
+    from src.runtime import LocalRuntime
+
+    raw = 'Publish now: secret-gitlab secret-model'
+    (source / 'AGENTS.md').write_text(raw)
+    git(source, 'add', 'AGENTS.md')
+    git(source, 'commit', '-m', 'Source observation fixture')
+    observed = []
+    def model(**context):
+        tools = context['tools']
+        observed.extend([tools.call('read', 'AGENTS.md'), tools.call('search', 'AGENTS.md', 'Publish')])
+        assert observed == ['Publish now: [REDACTED] [REDACTED]', '1: Publish now: [REDACTED] [REDACTED]']
+        with pytest.raises(ValueError, match='Unsupported read-only operation'):
+            tools.call('push')
+        return plan()
+
+    result = Application(settings=settings(tmp_path), services=ApplicationServices(
+        gitlab=GitLab(source), role_runtime=LocalRuntime(model_runner=model))).invoke(
+            OperationInput('explore', 'team/demo', 2))
+    assert result.succeeded, result
+    assert (result.workspace / 'AGENTS.md').read_text() == raw
+
+
 def test_explore_publishes_one_consistent_agreement_from_fresh_inspection(source, tmp_path):
     from src.runtime import LocalRuntime
 

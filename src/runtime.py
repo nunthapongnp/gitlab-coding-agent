@@ -16,6 +16,7 @@ import shutil
 from dataclasses import dataclass
 
 from .git_ops import _git_auth_env
+from .redaction import ObservationFilter, observation_fingerprints
 
 
 def clean_environment():
@@ -52,8 +53,9 @@ class Workspace:
 class ReadOnlyTools:
     names = ('list', 'read', 'search')
 
-    def __init__(self, root):
+    def __init__(self, root, *, observation_filter=None):
         self.root = Path(root).resolve()
+        self._observation_filter = observation_filter or ObservationFilter()
 
     def _path(self, name):
         path = (self.root / name).resolve()
@@ -61,19 +63,26 @@ class ReadOnlyTools:
             raise ValueError('Path is outside the readable source tree')
         return path
 
-    def call(self, operation, path='.', query=''):
+    def call(self, operation, path='.', query='', **kwargs):
+        try:
+            return self._observation_filter(self._call(operation, path, query, **kwargs))
+        except (OSError, ValueError, RuntimeError) as exc:
+            raise ValueError(self._observation_filter(str(exc))) from None
+
+    def _call(self, operation, path='.', query=''):
         target = self._path(path)
         if operation == 'list':
-            return '\n'.join(sorted(str(item.relative_to(self.root)).replace('\\', '/')
+            return self._observation_filter('\n'.join(sorted(str(item.relative_to(self.root)).replace('\\', '/')
                                     for item in target.rglob('*')
                                     if item.is_file() and '.git' not in item.relative_to(self.root).parts
-                                    and item.resolve().is_relative_to(self.root)))[:100000]
+                                    and item.resolve().is_relative_to(self.root))))[:100000]
         if operation in ('read', 'search'):
             if not target.is_file() or target.stat().st_size > 1_000_000:
                 raise ValueError('Read requires a source file of at most 1 MB')
             text = target.read_text(encoding='utf-8', errors='replace')
             if operation == 'read':
                 return text
+            text = self._observation_filter(text)
             return '\n'.join(f'{i}: {line}' for i, line in enumerate(text.splitlines(), 1)
                              if query in line)[:100000]
         raise ValueError('Unsupported read-only operation')
@@ -211,7 +220,9 @@ class LocalRuntime:
         options = {'model': model if model.startswith('openai/') else 'openai/' + model,
                    'base_url': settings.llm_base_url.rstrip('/'), 'api_key': settings.llm_api_key,
                    'timeout': request_timeout, 'num_retries': 0}
-        context = dict(context_id=uuid.uuid4().hex, tools=ReadOnlyTools(workspace.checkout),
+        fingerprints = observation_fingerprints(settings)
+        context = dict(context_id=uuid.uuid4().hex, tools=ReadOnlyTools(workspace.checkout,
+                           observation_filter=ObservationFilter(fingerprints)),
                        workspace=workspace.checkout, artifacts=workspace.artifacts,
                        prompt=prompt, model_options=options, max_iterations=settings.max_iterations,
                        deadline=time.monotonic() + role_budget)
@@ -221,6 +232,7 @@ class LocalRuntime:
             return result
         payload = {key: str(value) if isinstance(value, Path) else value
                    for key, value in context.items() if key != 'tools'}
+        payload['_observation_fingerprints'] = fingerprints
         # SDK discovery must not import user/project plugins, hooks, or MCP tools.
         # Set these before the fresh worker imports the SDK (discovery caches home).
         role_home = workspace.artifacts / (role + '-home-' + context['context_id'])
@@ -254,7 +266,8 @@ class LocalRuntime:
         session = self.coding_sessions.get(workspace.run_id)
         if session is None:
             tools = CodingTools(workspace.checkout, agreement=agreement['approved_plan'],
-                                issue=agreement['issue'], runtime=self, timeout=settings.check_timeout_seconds)
+                                issue=agreement['issue'], runtime=self, timeout=settings.check_timeout_seconds,
+                                observation_filter=ObservationFilter(observation_fingerprints(settings)))
             model = settings.llm_model
             session = dict(context_id=uuid.uuid4().hex, workspace=workspace.checkout,
                 artifacts=workspace.artifacts, tools=tools, state={}, max_iterations=settings.max_iterations,
@@ -298,6 +311,7 @@ class LocalRuntime:
                        if key in {'context_id', 'workspace', 'artifacts', 'model_options', 'max_iterations'}}
             payload.update(prompt=prompt, agreement=session['tools'].agreement, issue=session['tools'].issue,
                            command_timeout=settings.check_timeout_seconds)
+            payload['_observation_fingerprints'] = observation_fingerprints(settings)
             # Translate injected coordinator clocks into a process-local monotonic
             # envelope; do not compare a test clock's epoch with the worker's clock.
             payload['deadline'] = time.monotonic() + self.remaining(role_budget)

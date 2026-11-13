@@ -10,19 +10,8 @@ import re
 import threading
 
 from .runtime import ReadOnlyTools, clean_environment
-
-
-def redact(value, settings):
-    if isinstance(value, str):
-        for secret in (settings.gitlab_token, settings.llm_api_key):
-            if secret:
-                value = value.replace(secret, '[REDACTED]')
-        return value
-    if isinstance(value, dict):
-        return {redact(key, settings): redact(item, settings) for key, item in value.items()}
-    if isinstance(value, list):
-        return [redact(item, settings) for item in value]
-    return value
+from .redaction import redact
+from .protected_history import protected_state, fingerprint
 
 
 class CodingTools(ReadOnlyTools):
@@ -30,8 +19,8 @@ class CodingTools(ReadOnlyTools):
 
     names = ('list', 'read', 'search', 'write', 'delete', 'command')
 
-    def __init__(self, root, *, agreement, issue, runtime, timeout):
-        super().__init__(root)
+    def __init__(self, root, *, agreement, issue, runtime, timeout, observation_filter=None):
+        super().__init__(root, observation_filter=observation_filter)
         self.agreement, self.issue = agreement, issue
         self.runtime, self.timeout = runtime, timeout
         self.changes = {}
@@ -58,12 +47,12 @@ class CodingTools(ReadOnlyTools):
         self.blockers.append(message)
         raise ValueError(message)
 
-    def call(self, operation, path='.', query='', *, content='', reason='', acceptance_ids=None,
+    def _call(self, operation, path='.', query='', *, content='', reason='', acceptance_ids=None,
              approval_reference='', argv=None):
         with self.lock:
             self.runtime.remaining()
             if operation in ('list', 'read', 'search'):
-                return super().call(operation, path, query)
+                return super()._call(operation, path, query)
             if operation in ('write', 'delete'):
                 target = self.authorize(path, reason=reason, acceptance_ids=acceptance_ids,
                                         approval_reference=approval_reference)
@@ -159,26 +148,13 @@ def code_issue(context, settings, services, *, excluded_paths=(), repair_evidenc
         return command(['git', *args], cwd=context.checkout, timeout=min(30, remaining),
                        env=clean_environment(), **options)
 
-    def history_state():
-        metadata = {}
-        root = context.checkout / '.git'
-        paths = [root / name for name in ('config', 'HEAD', 'packed-refs', 'info/exclude')]
-        if (root / 'hooks').is_dir():
-            paths.extend((root / 'hooks').rglob('*'))
-        for path in paths:
-            if path.is_file():
-                metadata[path.relative_to(root).as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
-        return (git('rev-parse', 'HEAD').strip(), git('symbolic-ref', '--short', 'HEAD').strip(),
-                git('show-ref'), git('reflog', '--all', '--format=%H%x00%gD%x00%gs'),
-                git('ls-files', '--stage', '-z'), metadata)
-
     result = dict(status='BLOCKED', summary='Coding stopped before a local candidate was accepted.',
                   changed_files=[], blockers=[], product_change=None)
     try:
         if (context.workspace is None or not context.initial_source_commit
                 or context.workspace.run_id != context.run_id):
             raise ValueError('Coding requires the accepted fresh Execute Run workspace')
-        history = history_state()
+        history = protected_state(context.checkout, git)
         if history[:2] != (context.initial_source_commit, context.source_branch):
             raise ValueError('Initial branch/history differs from the accepted source')
         if git('diff', '--cached', '--name-only', '-z'):
@@ -212,9 +188,9 @@ def code_issue(context, settings, services, *, excluded_paths=(), repair_evidenc
         result['product_change'] = collect_candidate(context, git, excluded_paths=excluded_paths,
             secrets=(settings.gitlab_token, settings.llm_api_key))
         result['changed_files'] = [item['path'] for item in result['product_change']['files']]
-        current = history_state()
-        result['product_change']['initial_history_identity'] = hashlib.sha256(json.dumps(history, sort_keys=True).encode()).hexdigest()
-        result['product_change']['observed_history_identity'] = hashlib.sha256(json.dumps(current, sort_keys=True).encode()).hexdigest()
+        current = protected_state(context.checkout, git)
+        result['product_change']['initial_history_identity'] = fingerprint(history)
+        result['product_change']['observed_history_identity'] = fingerprint(current)
         result['product_change'].pop('identity')
         result['product_change']['identity'] = hashlib.sha256(json.dumps(result['product_change'], sort_keys=True).encode()).hexdigest()
         if current != history or git('diff', '--cached', '--name-only', '-z'):

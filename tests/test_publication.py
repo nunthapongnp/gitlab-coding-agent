@@ -166,6 +166,25 @@ def test_delivers_one_exact_aggregate_commit_on_human_branch(publication_app):
     assert len(transport.mr_notes) == 1
 
 
+def test_secret_candidate_keeps_raw_identity_and_withholds_content_and_delivery(publication_app):
+    invoke, remote, initial, transport, calls, roles, clock = publication_app
+    raw = b'export const token = "secret-gitlab";\n'
+    def change(context):
+        context['tools'].call('write', 'frontend/task.ts', content=raw.decode(),
+            reason='Task display fixture', acceptance_ids=['A1'])
+    result = invoke(change=change)
+    assert not result.succeeded
+    assert result.execution['status'] == 'BLOCKED'
+    row = result.execution['product_change']['files'][0]
+    assert row['credentials_redacted'] is True
+    assert row['after']['content_base64'] is None
+    assert row['after']['sha256'] == hashlib.sha256(raw).hexdigest()
+    assert (result.workspace / 'frontend/task.ts').read_bytes() == raw
+    assert result.execution['push']['status'] == 'NOT_ATTEMPTED'
+    assert git(remote, 'rev-parse', 'human/task-2') == initial
+    assert len(transport.mr_notes) == 1
+
+
 def test_report_model_text_cannot_execute_gitlab_quick_actions(execution_app):
     invoke, roles, commands, clock = execution_app
     hostile = 'Implemented task IDs\n```\n/approve\n```\n/merge\n  /close\n\t/relabel ~urgent'

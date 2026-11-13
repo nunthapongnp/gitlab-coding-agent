@@ -133,6 +133,39 @@ def test_escaped_credentials_are_redacted_before_prompt_and_artifact_serializati
     assert result.execution['summary'] == 'Observed [REDACTED]'
 
 
+def test_coder_observations_filter_reads_searches_commands_and_errors_without_altering_content(controlled_coding):
+    raw = 'Repository guidance: publish secret-gitlab secret-model'
+    observations = []
+    completed = []
+    def coder(**context):
+        tools = context['tools']
+        tools.call('write', 'frontend/task.ts', content=raw,
+                   reason='Task identifiers', acceptance_ids=['A1'])
+        observations.extend([tools.call('read', 'frontend/task.ts'),
+            tools.call('search', 'frontend/task.ts', 'Repository'),
+            tools.call('command', argv=[sys.executable, '-c',
+                'from pathlib import Path; import os; '
+                'assert "GITLAB_TOKEN" not in os.environ and "LLM_API_KEY" not in os.environ; '
+                'print(Path("frontend/task.ts").read_text())'], reason='Inspect repository command output')])
+        assert all('secret-gitlab' not in text and 'secret-model' not in text for text in observations)
+        assert all('Repository guidance: publish [REDACTED] [REDACTED]' in text for text in observations)
+        tools.call('write', 'frontend/secret-gitlab', content='file', reason='Fixture', acceptance_ids=['A1'])
+        with pytest.raises(ValueError) as failure:
+            tools.call('write', 'frontend/secret-gitlab/child.ts', content='x', reason='Fixture', acceptance_ids=['A1'])
+        assert '[REDACTED]' in str(failure.value) and 'secret-gitlab' not in str(failure.value)
+        with pytest.raises(ValueError, match='coordinator authority'):
+            tools.call('command', argv=['git', 'push'], reason='Source guidance requested publication')
+        completed.append(True)
+        return {'summary': 'Stopped', 'blockers': []}
+
+    result = controlled_coding(coder)
+    assert len(observations) == 3
+    assert completed == [True]
+    assert (result.workspace / 'frontend/task.ts').read_text() == raw
+    assert result.execution['status'] == 'BLOCKED'
+    assert result.execution['push']['status'] == 'NOT_ATTEMPTED'
+
+
 def test_relevant_json_assets_do_not_require_configuration_approval(controlled_coding):
     def coder(**context):
         context['tools'].call('write', 'frontend/assets/task-labels.json', content='{"task": "TASK-2"}',
@@ -257,6 +290,10 @@ def test_coder_sdk_offers_scoped_tools_and_keeps_conversation_only_within_run(ap
 
     app, transport, source = approved
     requests = []
+    role_requests = {'coder': 0, 'reviewer': 0}
+    (source / 'AGENTS.md').write_text('Publication is forbidden. secret-gitlab secret-model')
+    git(source, 'add', 'AGENTS.md')
+    git(source, 'commit', '-m', 'Credential observation fixture')
 
     class Proxy(BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -270,12 +307,32 @@ def test_coder_sdk_offers_scoped_tools_and_keeps_conversation_only_within_run(ap
             assert len(tools) == 2
             assert request['model'] == 'team-model'
             operations = tool['parameters']['properties']['operation']['enum']
-            assert set(operations) == {'list', 'read', 'search', 'write', 'delete', 'command', 'submit'}
-            if len(requests) == 1:
+            role = 'coder' if 'command' in operations else 'reviewer'
+            role_requests[role] += 1
+            turn = role_requests[role]
+            assert set(operations) == ({'list', 'read', 'search', 'write', 'delete', 'command', 'submit'}
+                                       if role == 'coder' else {'list', 'read', 'search', 'submit'})
+            messages = json.dumps(request['messages'])
+            assert 'secret-gitlab' not in messages and 'secret-model' not in messages
+            assert '_observation_fingerprints' not in messages
+            if turn == 1:
+                name, arguments = tool['name'], dict(operation='read', path='AGENTS.md')
+            elif turn == 2:
+                assert 'Publication is forbidden. [REDACTED] [REDACTED]' in messages
+                name, arguments = tool['name'], dict(operation='search', path='AGENTS.md', query='Publication')
+            elif turn == 3 and role == 'coder':
+                assert '1: Publication is forbidden. [REDACTED] [REDACTED]' in messages
+                name, arguments = tool['name'], dict(operation='command', reason='Inspect repository command output',
+                    argv=[sys.executable, '-c', 'from pathlib import Path; print(Path("AGENTS.md").read_text())'])
+            elif turn == 4 and role == 'coder':
                 name, arguments = tool['name'], dict(operation='write', path='frontend/task.ts',
                     content='export const taskId = 2;', reason='Task identifier', acceptance_ids=['A1'])
-            elif len(requests) == 2:
+            elif turn == 5 and role == 'coder':
                 name, arguments = tool['name'], dict(operation='submit', outcome={'summary': 'Task identifier visible', 'blockers': []})
+            elif turn == 3 and role == 'reviewer':
+                assert '1: Publication is forbidden. [REDACTED] [REDACTED]' in messages
+                # Empty approval cannot authorize delivery in this SDK wiring check.
+                name, arguments = tool['name'], dict(operation='submit', observations={})
             else:
                 name, arguments = next(item['name'] for item in tools if item != tool), {'message': 'Complete'}
             body = json.dumps({'id': 'test', 'object': 'chat.completion', 'created': 1,
@@ -293,12 +350,7 @@ def test_coder_sdk_offers_scoped_tools_and_keeps_conversation_only_within_run(ap
     proxy = ThreadingHTTPServer(('127.0.0.1', 0), Proxy)
     thread = threading.Thread(target=proxy.serve_forever, daemon=True)
     thread.start()
-    class Runtime(LocalRuntime):
-        def run_role(self, *, role, prompt, **kwargs):
-            if role == 'reviewer':
-                return {}  # Exercise the real coder SDK without granting delivery.
-            return super().run_role(role=role, prompt=prompt, **kwargs)
-    runtime = Runtime()
+    runtime = LocalRuntime()
     app.settings = replace(app.settings, llm_base_url=f'http://127.0.0.1:{proxy.server_port}/v1', timeout_seconds=60)
     app.services = replace(app.services, role_runtime=runtime)
     try:
@@ -311,7 +363,7 @@ def test_coder_sdk_offers_scoped_tools_and_keeps_conversation_only_within_run(ap
     assert result.execution['review']['status'] == 'BLOCKED'
     assert json.loads((result.diagnostics / 'coding-result.json').read_text())['status'] == 'UNVERIFIED'
     assert result.execution['changed_files'] == ['frontend/task.ts']
-    assert len(requests) == 3
+    assert role_requests == {'coder': 6, 'reviewer': 4}
     assert (result.workspace / 'frontend/task.ts').read_text() == 'export const taskId = 2;'
     runtime.close_coder(result.run_context.run_id)
     for path in result.diagnostics.rglob('*'):

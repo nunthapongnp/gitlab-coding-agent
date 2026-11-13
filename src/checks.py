@@ -129,12 +129,18 @@ def discover(context):
                   'repository analysis')
         module_files = [p for p in files if p.is_relative_to(directory)]
         case_candidates = [p for p in module_files if re.search(
-            r'(?:\.(?:spec|test)\.[cm]?[jt]sx?$|(?:Test|Tests)\.java$|(?:^|[/\\])test_[^/\\]+\.py$|_test\.py$)', str(p))
-            and p.stat().st_size > 0]
+            r'(?:\.(?:spec|test)\.[cm]?[jt]sx?$|(?:Test[^/\\]*|[^/\\]*(?:Test|Tests|TestCase))\.java$|(?:^|[/\\])test_[^/\\]+\.py$|_test\.py$)', str(p))
+            or (p.suffix == '.java' and 'src/test/' in p.relative_to(directory).as_posix())]
+        case_candidates = [p for p in case_candidates if p.stat().st_size > 0]
         cases = [p.relative_to(root).as_posix() for p in case_candidates if re.search(
-            r'\b(?:it|test|specify)\s*\(|@(?:Test|ParameterizedTest|RepeatedTest)\b|\bdef\s+test_\w+\s*\(',
+            r'\b(?:it|test|specify)\s*\(|@(?:[\w.]*\.)?(?:Test|ParameterizedTest|RepeatedTest|TestFactory|TestTemplate)\b|\bdef\s+test_\w+\s*\(|\bpublic\s+void\s+test\w*\s*\(\s*\)',
             p.read_text(encoding='utf-8', errors='replace'))]
-        if not cases:
+        if not cases and pom.is_file() and any(p.suffix == '.java' for p in case_candidates):
+            selected['test'] = dict(selected.get('test', dict(kind='test', module=module,
+                scope=scope, argv=[], cwd=module, source='test source inspection', evidence=[])),
+                status='UNVERIFIED', executed=False,
+                reason='Java test sources exist but declarations are unrecognized; cannot establish absence of test cases.')
+        elif not cases:
             selected['test'] = dict(kind='test', module=module, scope=scope, argv=[], cwd=module,
                 source='test source inspection', evidence='No executable test declarations found in inspected module sources.',
                 reason='Configured runner has no test cases.' if 'test' in selected else 'No test cases or applicable suite found.',

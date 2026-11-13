@@ -9,6 +9,7 @@ import time
 from typing import Literal
 
 from .runtime import ReadOnlyTools
+from .redaction import ObservationFilter
 
 
 def run_sdk(context, *, sdk=None):
@@ -17,7 +18,8 @@ def run_sdk(context, *, sdk=None):
     from openhands.sdk.tool import Action, Observation, ToolDefinition, ToolExecutor, register_tool
 
     result = {}
-    tools = ReadOnlyTools(context['workspace'])
+    tools = ReadOnlyTools(context['workspace'], observation_filter=ObservationFilter(
+        context.get('_observation_fingerprints', ())))
 
     class InspectionAction(Action):
         operation: Literal['list', 'read', 'search', 'submit']

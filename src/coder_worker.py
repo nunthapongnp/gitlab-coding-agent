@@ -11,6 +11,7 @@ from typing import Literal
 
 from .coding import CodingTools
 from .runtime import LocalRuntime
+from .redaction import ObservationFilter
 
 
 class CoderSession:
@@ -23,7 +24,8 @@ class CoderSession:
         if context.get('deadline') is not None:
             runtime.bind_deadline(context['deadline'])
         tools = CodingTools(context['workspace'], agreement=context['agreement'], issue=context['issue'],
-                            runtime=runtime, timeout=context['command_timeout'])
+                            runtime=runtime, timeout=context['command_timeout'],
+                            observation_filter=ObservationFilter(context.get('_observation_fingerprints', ())))
         self.tools = tools
         self.deadline = context.get('deadline')
         self.request_timeout = context['model_options']['timeout']

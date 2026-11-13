@@ -277,6 +277,46 @@ def test_zero_executed_cases_is_not_passing_test_coverage(pilot):
     assert calls == []
 
 
+@pytest.mark.parametrize('filename, declaration', [
+    ('TestGreeting.java', 'class TestGreeting { @Test void greeting() {} }'),
+    ('GreetingTestCase.java', 'class GreetingTestCase { @Test void greeting() {} }'),
+    ('LegacyTestCase.java', 'class LegacyTestCase extends TestCase { public void testGreeting() {} }'),
+])
+def test_existing_maven_cases_execute_and_real_failure_withholds_publication(pilot, filename, declaration):
+    agreement, files, calls, invoke = pilot
+    agreement['scope'] = ['backend']
+    files.clear()
+    files.update({'backend/pom.xml': '<project/>', 'backend/src/test/java/' + filename: declaration})
+    agreement['commands'] = [command('build', 'print("build passed")', module='backend'),
+        command('test', 'import sys; print("Tests run: 1, Failures: 1"); sys.exit(7)', module='backend')]
+    result = invoke()
+    test = next(row for row in result.execution['baseline']['checks'] if row['kind'] == 'test')
+    assert test['source'] == 'Approved Plan'
+    assert test['test_cases'] == ['backend/src/test/java/' + filename]
+    assert test['executed'] is True and test['status'] == 'FAIL' and test['exit_code'] == 7
+    assert 'Failures: 1' in Path(test['log_file']).read_text()
+    assert result.execution['baseline']['status'] == 'FAIL'
+    assert calls == []
+    assert result.execution['push']['status'] == 'NOT_ATTEMPTED'
+
+
+def test_unrecognized_maven_test_sources_preserve_plan_evidence_and_withhold_publication(pilot):
+    agreement, files, calls, invoke = pilot
+    agreement['scope'] = ['backend']
+    files.clear()
+    files.update({'backend/pom.xml': '<project/>',
+                  'backend/src/test/java/CustomCases.java': 'class CustomCases { @CustomCase void greeting() {} }'})
+    explicit = command('test', 'print("custom runner")', module='backend')
+    agreement['commands'] = [command('build', 'print("build passed")', module='backend'), explicit]
+    result = invoke()
+    test = next(row for row in result.execution['baseline']['checks'] if row['kind'] == 'test')
+    assert test['source'] == 'Approved Plan' and test['argv'] == explicit['argv']
+    assert test['status'] == 'UNVERIFIED'
+    assert 'cannot establish absence' in test['reason']
+    assert result.execution['baseline']['status'] == 'UNVERIFIED'
+    assert calls == [] and result.execution['push']['status'] == 'NOT_ATTEMPTED'
+
+
 @pytest.mark.parametrize('scenario, expected', [('missing-build', 'UNVERIFIED'),
     ('missing-executable', 'BLOCKED'), ('browser-failure', 'FAIL'), ('empty-spec', 'PASS')])
 def test_missing_validation_environment_and_empty_cases_are_distinct(pilot, scenario, expected):

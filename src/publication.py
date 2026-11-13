@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import base64
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -11,6 +10,7 @@ from urllib.parse import urlsplit
 
 from .coding import artifact_path, collect_candidate, content
 from .review import assert_review_current
+from .protected_history import protected_state, fingerprint
 
 
 def publication_environment():
@@ -23,19 +23,6 @@ def publication_environment():
                GIT_CONFIG_GLOBAL=os.devnull, GIT_TERMINAL_PROMPT='0',
                GCM_INTERACTIVE='never')
     return env
-
-
-def _history(context, git):
-    root = context.checkout / '.git'
-    paths = [root / name for name in ('config', 'HEAD', 'packed-refs', 'info/exclude')]
-    if (root / 'hooks').is_dir():
-        paths.extend((root / 'hooks').rglob('*'))
-    metadata = {path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
-                for path in paths if path.is_file()}
-    state = (git('rev-parse', 'HEAD').strip(), git('symbolic-ref', '--short', 'HEAD').strip(),
-             git('show-ref'), git('reflog', '--all', '--format=%H%x00%gD%x00%gs'),
-             git('ls-files', '--stage', '-z'), metadata)
-    return hashlib.sha256(json.dumps(state, sort_keys=True).encode()).hexdigest()
 
 
 def publish_issue(context, candidate, settings, services):
@@ -81,7 +68,7 @@ def publish_issue(context, candidate, settings, services):
                     timeout=min(30, context.remaining(services.clock)), env=operation_env,
                     **({'binary': True} if binary else {}))
 
-            if (_history(context, git) != change.get('initial_history_identity')
+            if (fingerprint(protected_state(context.checkout, git)) != change.get('initial_history_identity')
                     or change.get('initial_history_identity') != change.get('observed_history_identity')):
                 raise ValueError('Unexpected history, Git metadata or staged content after coding')
             current = collect_candidate(context, git, excluded_paths=candidate.get('generated_files', []),
