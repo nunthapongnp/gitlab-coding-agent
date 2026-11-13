@@ -2,8 +2,12 @@ from __future__ import annotations
 
 from urllib.parse import quote
 from typing import Any
+import time
 
 import requests
+
+RECOGNIZED_LABELS = {'agent::explore', 'agent::implement', 'agent::in-progress',
+                     'agent::needs-review', 'agent::approved'}
 
 
 class GitLabAPIError(RuntimeError):
@@ -27,8 +31,13 @@ class GitLabClient:
 
     def _request(self, method: str, path: str, **kwargs: Any) -> Any:
         url = f"{self.base_url}/api/v4/{path.lstrip('/')}"
+        deadline = kwargs.pop('deadline', None)
+        clock = kwargs.pop('clock', time.monotonic)
+        timeout = self.timeout if deadline is None else min(self.timeout, deadline - clock())
+        if timeout <= 0:
+            raise GitLabAPIError('Execute Run deadline expired before GitLab request')
         try:
-            response = self.session.request(method, url, timeout=self.timeout, **kwargs)
+            response = self.session.request(method, url, timeout=timeout, **kwargs)
             response.raise_for_status()
             if response.status_code == 204 or not response.content:
                 return None
@@ -67,6 +76,79 @@ class GitLabClient:
         )
         if not isinstance(payload, dict):
             raise GitLabAPIError("GitLab returned an unexpected issue response")
+        return payload
+
+    def get_issue_notes(self, project: str | int, issue_iid: int) -> list[dict]:
+        """Read the complete discussion, including pages beyond the first 100."""
+        notes = []
+        page = 1
+        while True:
+            payload = self._request('GET',
+                f'projects/{self._project_path(project)}/issues/{issue_iid}/notes',
+                params={'page': page, 'per_page': 100, 'order_by': 'id', 'sort': 'asc'})
+            if not isinstance(payload, list):
+                raise GitLabAPIError('GitLab returned an unexpected Issue comment list')
+            if not payload:
+                return notes
+            notes.extend(payload)
+            page += 1
+
+    def replace_issue_status(self, project, issue_iid, expected, replacement):
+        issue = self.get_issue(project, issue_iid)
+        if set(issue.get('labels', [])) & RECOGNIZED_LABELS != {expected}:
+            raise GitLabAPIError('Issue workflow labels changed; manual review required')
+        payload = self._request('PUT',
+            f'projects/{self._project_path(project)}/issues/{issue_iid}',
+            json={'remove_labels': expected, 'add_labels': replacement})
+        if not isinstance(payload, dict) or set(payload.get('labels', [])) & RECOGNIZED_LABELS != {replacement}:
+            raise GitLabAPIError('Issue label replacement was not confirmed')
+        return payload
+
+    def create_issue_note(self, project, issue_iid, body):
+        return self._request('POST', f'projects/{self._project_path(project)}/issues/{issue_iid}/notes',
+                             json={'body': body})
+
+    def _all_pages(self, path, **budget):
+        items, page = [], 1
+        while True:
+            payload = self._request('GET', path, params={'page': page, 'per_page': 100}, **budget)
+            if not isinstance(payload, list):
+                raise GitLabAPIError('GitLab returned an unexpected paginated response')
+            if not payload:
+                return items
+            items.extend(payload)
+            page += 1
+
+    def get_merge_request(self, project, mr_iid, **budget):
+        payload = self._request('GET', f'projects/{self._project_path(project)}/merge_requests/{mr_iid}', **budget)
+        if not isinstance(payload, dict):
+            raise GitLabAPIError('GitLab returned an unexpected MR response')
+        return payload
+
+    def get_merge_request_notes(self, project, mr_iid, **budget):
+        return self._all_pages(f'projects/{self._project_path(project)}/merge_requests/{mr_iid}/notes', **budget)
+
+    def create_merge_request_note(self, project, mr_iid, body, **budget):
+        return self._request('POST', f'projects/{self._project_path(project)}/merge_requests/{mr_iid}/notes',
+                             json={'body': body}, **budget)
+
+    def get_issue_related_merge_requests(self, project, issue_iid):
+        return self._all_pages(f'projects/{self._project_path(project)}/issues/{issue_iid}/related_merge_requests')
+
+    def get_branch(self, project, branch):
+        payload = self._request('GET', f'projects/{self._project_path(project)}/repository/branches/{quote(branch, safe="")}')
+        if not isinstance(payload, dict):
+            raise GitLabAPIError('GitLab returned an unexpected branch response')
+        return payload
+
+    def replace_merge_request_status(self, project, mr_iid, expected, replacement, **budget):
+        mr = self.get_merge_request(project, mr_iid, **budget)
+        if set(mr.get('labels', [])) & RECOGNIZED_LABELS != {expected}:
+            raise GitLabAPIError('MR workflow labels changed; manual review required')
+        payload = self._request('PUT', f'projects/{self._project_path(project)}/merge_requests/{mr_iid}',
+            json={'remove_labels': expected, 'add_labels': replacement}, **budget)
+        if not isinstance(payload, dict) or set(payload.get('labels', [])) & RECOGNIZED_LABELS != {replacement}:
+            raise GitLabAPIError('MR label replacement was not confirmed')
         return payload
 
     def find_open_merge_request(

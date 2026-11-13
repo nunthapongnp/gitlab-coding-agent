@@ -1,3 +1,5 @@
+> **Superseded historical design:** Use the [current Phase 0 manual workflow contract](../MANUAL_WORKFLOW_CONTRACT.md) and GitHub Issue #6 with its linked slices. Conflicting requirements below are inactive, including label-selected modes, plan versions, mandatory Docker, per-Task commits, partial publication, and the old runtime limit.
+
 # Phase 0 specification package
 
 This package translates the accepted implementation plan and all three ADRs into English specifications. It is a local delivery to the requested directory; no tracker issue or external triage label has been created. Each specification is marked ready-for-agent locally.
